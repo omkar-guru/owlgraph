@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Build artifacts: ONNX graphs, TensorRT engines and result JSON.
+# Engines are specific to this GPU, driver and TensorRT version - rebuild, never commit.
+artifacts/
+acgdataset/

@@ -1,0 +1,34 @@
+[project]
+name = "sggpipeline"
+version = "0.1.0"
+description = "Open-vocabulary video scene graph pipeline - Stage 1: detector benchmarking"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "torch>=2.9",
+    "torchvision",
+    "transformers>=4.50",
+    "numpy",
+    "pillow",
+    "opencv-python-headless",
+    "av",
+    "onnx",
+    "tensorrt",
+    "cuda-python",
+    "pycocotools",
+    "tqdm",
+    "pyyaml",
+    "markitdown[docx]>=0.1.7",
+    "nvidia-modelopt[onnx]>=0.46",
+]
+
+[project.scripts]
+sgg = "sggpipeline.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.15"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+module-name = "sggpipeline"

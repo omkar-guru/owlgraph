@@ -1,0 +1,479 @@
+# Stage 1 results log
+
+Every experiment run so far, with method and caveats. Numbers are meaningless
+without the conditions that produced them, so each entry states what was
+measured, on what, and what the result does **not** support.
+
+**Hardware for all measurements below:** RTX 5070 Ti Laptop (sm_120, 12 GB),
+WSL2, 15 GB host RAM. torch 2.14.0+cu130, TensorRT 11.3.0.99, modelopt 0.46.1.
+**These numbers do not transfer to other hardware** — TensorRT engines are built
+per-GPU, and this one was measured at 46.9 TFLOPS peak fp16, likely
+power-throttled. Re-measure everywhere.
+
+Raw JSON for each is under `artifacts/results/`.
+
+---
+
+## 1. Correctness gates (passed)
+
+Not results in themselves, but everything downstream is void without them.
+
+| Check | Result |
+| --- | --- |
+| Decomposed `Owlv2DetectionGraph` vs stock HF forward | logits 7.6e-06, boxes and objectness **bit-exact** |
+| TRT fp16 engine vs eager fp32 reference | cosine ≥0.9997; detection match rate 0.86–1.00; mean best IoU 0.86–0.99 |
+| GPU preprocessing vs stock `Owlv2ImageProcessor` | max abs diff **1.4e-06**, 0% of pixels above 1e-3 |
+| TRT YOLO path vs ultralytics PyTorch | mAP within ~3% (0.1521/0.1480, 0.1605/0.1583, 0.1966/0.1913) |
+| AG frame indexing (1-based) | no zeros in 288,782 entries, global min 3, boxes render correctly on people/chairs/tables |
+| AG split disjointness | 7,787 train vs 1,814 test videos; **zero** video, frame, or label overlap |
+
+The YOLO parity check is slightly *high* rather than exact, consistent with this
+project using a full 640×640 letterbox where ultralytics uses minimal-padding
+rect inference. No drift indicating a broken transform.
+
+---
+
+## 2. Preprocessing optimization
+
+Profiling found ~70% of preprocessing time in a single `torch.conv2d`: OWLv2
+anti-aliases before downsampling (reproducing skimage `anti_aliasing=True`), and
+the blur ran on the **padded** 1920×1920 fp32 tensor on CPU.
+
+| Path | ms/frame (1080p) | Note |
+| --- | --- | --- |
+| Stock HF `Owlv2ImageProcessor` | 78.9–101.3 | CPU; ~70% in the anti-alias blur |
+| **GPU, identical ordering** | **4.2** | **18.7× faster**, matches to 1.4e-06 |
+| GPU, resize-before-pad | 3.0 | 26× but 0.2% of pixels differ at the seam — **rejected** |
+
+Breakdown of the remaining 4.2 ms: PIL→numpy 0.91, H2D 0.65, GPU compute 2.11.
+
+End-to-end effect: **87.5 ms → 23.8 ms** (11.4 → 42 FPS) at 960px.
+
+`pad_last` was rejected deliberately: 1.2 ms saved is not worth changing output
+for a stage that is no longer the bottleneck.
+
+---
+
+## 3. Resolution sweep (fp16)
+
+`artifacts/results/resolution_sweep.json`. Accuracy on 1,200 AG test frames
+across 1,143 videos, **all 36 AG classes**.
+
+| Resolution | Patches | Latency | FPS | mAP | mAP@50 | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 960 (native) | 3600 | 19.00 ms | 50.7 | 0.1077 | 0.1512 | 0.3985 |
+| 768 | 2304 | 10.63 ms | 87.3 | 0.0831 (−23%) | 0.1492 (**−1.3%**) | 0.3270 (−18%) |
+| 640 | 1600 | 6.70 ms | 122.8 | 0.0568 (−47%) | 0.1417 (**−6.3%**) | 0.2537 (−36%) |
+
+Latency was predicted from FLOPs within 5% before measuring, so the analytic
+model is trustworthy for planning.
+
+**The headline is the divergence, not the averages.** mAP@50 barely moves while
+mAP@[.5:.95] collapses: reduced resolution still finds and classifies objects but
+localises them coarsely. Averaging the two would have hidden this entirely.
+
+Lower resolution requires `retarget_resolution()` — resampling the learned
+position grid into the weights at export time. The runtime
+`interpolate_pos_encoding` path is unusable for TensorRT (emits a `Range` op
+required in fp32, colliding with fp16 neighbours).
+
+---
+
+## 4. Roofline — why engine-side optimization was abandoned
+
+| Measurement | Value |
+| --- | --- |
+| Peak fp16 dense matmul, this GPU | **46.9 TFLOPS** |
+| OWLv2-B/16 @960 analytic cost | 1.09 TFLOP/frame |
+| Engine effective throughput | **52.9 TFLOPS** |
+
+The engine runs *above* the dense-matmul ceiling, because TensorRT fuses
+attention. Consequences, each measured rather than assumed:
+
+- **CUDA graphs: no gain.** Python/binding overhead measured at ~0 ms — the
+  engine is compute-bound, not launch-bound.
+- **Builder tactics / larger batches: no gain.** No idle capacity to reclaim.
+- **FlashAttention: already in use.** Engine device memory is 58 MB, while a
+  materialised fp16 score matrix at 960px would be 25.9 MB per head × 12 heads ≈
+  311 MB for one layer. It cannot fit, so TRT is necessarily using a fused tiled
+  kernel.
+- **Structural sparsity: inert.** `BuilderFlag.SPARSE_WEIGHTS` exists but does
+  nothing to dense weights; benefiting requires 2:4 pruning *and* fine-tuning.
+
+46.9 TFLOPS is low for this silicon (20–27 W drawn against a 120 W cap), so the
+GPU was likely power-throttled throughout. Treat all latency here as pessimistic.
+
+---
+
+## 5. YOLO26 vs OWLv2 — first attempt (superseded)
+
+Kept as a record of a methodological error worth not repeating.
+
+Run with OWLv2 in TensorRT and YOLO in ultralytics PyTorch, and with OWLv2 timed
+engine-only while YOLO's timing included Python preprocessing, NMS and result
+construction. It produced the conclusion "OWLv2@960 is faster than yolo26x"
+(16.99 ms vs 22.67 ms), which **normalization reversed**. Three separate biases
+all favoured OWLv2.
+
+Accuracy from this run was valid (same frames, GT and scoring) and matched the
+normalized re-run within 3%.
+
+---
+
+## 6. YOLO26 vs OWLv2 — normalized
+
+`artifacts/results/normalized_compare.json`. Both models as strongly-typed fp16
+TensorRT engines, GPU preprocessing, GPU postprocessing, timed at two scopes.
+1,144 frames, 2,400 GT boxes.
+
+**Scored only on the 14 AG classes reachable from COCO**: bag, bed, book, chair,
+cup/glass/bottle, dish, laptop, person, phone/camera, refrigerator, sandwich,
+sofa/couch, table, television. Each model keeps its own full vocabulary at
+inference (YOLO all 80 COCO, OWLv2 all 36 AG prompts); out-of-set predictions are
+discarded rather than the vocabularies trimmed, so neither gets an easier problem
+than deployment.
+
+| Model | Res | mAP | mAP@50 | AR@100 | engine ms | e2e ms | e2e FPS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| OWLv2-B/16 | 640 | 0.1019 | 0.2545 | 0.3134 | 6.60 | 7.63 | 131.0 |
+| OWLv2-B/16 | 960 | **0.2001** | **0.2782** | **0.5123** | 18.62 | 19.12 | 52.3 |
+| yolo26s | 640 | 0.1521 | 0.2091 | 0.4008 | **3.96** | **5.60** | **178.6** |
+| yolo26m | 640 | 0.1605 | 0.2203 | 0.4234 | 4.41 | 6.02 | 166.2 |
+| yolo26x | 640 | 0.1966 | 0.2618 | 0.4493 | 7.33 | 9.08 | 110.2 |
+
+Findings:
+
+- **At matched 640, YOLO wins outright.** yolo26s is faster (5.60 vs 7.63 ms)
+  *and* better on strict mAP (0.152 vs 0.102). OWLv2@640 keeps only the mAP@50
+  lead — it finds objects but boxes them loosely.
+- **yolo26x is 2.1× faster than OWLv2@960** (9.08 vs 19.12 ms) at **statistically
+  tied mAP** (0.1966 vs 0.2001, a 1.8% gap).
+- **OWLv2's real margin is recall**: AR@100 0.512 vs 0.449, **+14%**. That matters
+  more than mAP for this pipeline — a relationship cannot be built for an object
+  never detected, so AR feeds the pair-head recall ceiling.
+- **NMS costs ~1.6 ms** for YOLO (5.60 − 3.96) vs ~1.0 ms for OWLv2. YOLO26
+  exports with `end2end=False`, so engine-only measurement flatters it — it wins
+  anyway.
+
+**What this does not show:** the other 22 AG classes, where YOLO26 scores zero by
+construction — including `doorway`, `broom`, `vacuum`, `blanket`, `towel`, which
+carry interactions. It also excludes OWLv2's text-aligned features (needed by the
+semantic head) and shared visual tokens (needed by the SG-ViT pair head). The
+detector decision is not reducible to this table.
+
+---
+
+## 7. Quantization
+
+| Item | State |
+| --- | --- |
+| int8 toolchain | **Proven** — smoke test 195 s, 202 Q/DQ pairs inserted |
+| `base_fp8` | **Blocked** — calibration crashed twice on host RAM (since fixed by streaming) |
+| `large_int8` | **Never built** — the original Stage 1 goal |
+
+TensorRT 11 builds strongly-typed networks only: `BuilderFlag.FP16`,
+`BuilderFlag.INT8` and `IInt8EntropyCalibrator2` do not exist. Precision is a
+property of the ONNX graph — fp16 by dtype conversion, int8/fp8 by Q/DQ nodes
+from calibrated PTQ.
+
+Calibration is guarded structurally: `prepare` refuses when `--calib-split`
+equals `--eval-split`, writes a manifest of every frame used, and `evaluate`
+cross-checks it and reports `calibration_leakage.clean`.
+
+---
+
+## 8. Standing caveats for every accuracy number here
+
+1. **Absolute mAP is a floor, not a quality statement.** AG annotates only
+   objects involved in an annotated interaction, so correctly finding an
+   unlabelled real object scores as a false positive. Between-variant comparison
+   is valid because all variants are penalised identically; the absolute value is
+   not a detector-quality claim.
+2. **`person` AP measures agreement with a detector**, not with human annotation
+   — AG's person boxes are themselves detector output.
+3. **Subset size.** Most runs use 800–1,200 of 68,183 available test frames,
+   spread across videos. Indicative, not final.
+4. **Untested confound: padding value.** transformers pads with `0.0`; original
+   OWLv2 used `0.5` grey. Verified by measurement, never A/B'd. If HF's default
+   is a regression it costs real mAP and would look like quantization damage.
+5. **`base_fp16` vs `large_int8` would confound size with precision.** A
+   `large_fp16` control is required before attributing any difference.
+
+---
+
+## 9. Box-error diagnostic and affine calibration
+
+`artifacts/results/box_error_diagnostic.json`, `artifacts/results/box_calibration.json`.
+
+### Diagnosis: the low-resolution error is systematic, not random
+
+800 test frames. For each GT box, the best same-class prediction's residual was
+measured in scale-invariant form (centre offset as a fraction of GT size, log
+size ratio). The **mean** is bias; the **standard deviation** is jitter.
+
+| Variant | matches | mean IoU | IoU>=.75 | log_w bias | log_w jitter | log_h bias | log_h jitter |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| owlv2@960 | 1753 | 0.833 | 0.798 | **-0.005** | 0.160 | **+0.004** | 0.147 |
+| owlv2@768 | 1763 | 0.767 | 0.659 | **+0.083** | 0.174 | **+0.068** | 0.154 |
+| owlv2@640 | 1746 | 0.697 | 0.342 | **+0.149** | 0.189 | **+0.108** | 0.164 |
+
+At 640 the boxes are **16% too wide and 11% too tall, consistently**, while
+jitter grows only 11-18% and match counts stay flat (~1750). Detection is
+unaffected; only regression degrades. A uniform inflation tips otherwise-correct
+boxes past strict IoU thresholds, which is why the IoU>=0.75 fraction collapses
+(0.798 -> 0.342) while mean IoU only falls 0.83 -> 0.70.
+
+Mechanically: a token covers 16x16 source pixels at 640 versus 10.7x10.7 at 960,
+so both the grid prior from `compute_box_bias` and the regressed feature are 1.5x
+coarser.
+
+### Fix: per-class affine correction, fitted on train, applied to test
+
+Size scale and centre shift per class, global fallback below 15 matches. Applied
+at postprocessing; cost is numpy on <=100 boxes, unmeasurable against a 6.7 ms
+engine. No training, no architecture change.
+
+| Res | mAP before | mAP after | delta | mAP@75 before | mAP@75 after | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 640 | 0.0568 | **0.0816** | **+43.6%** | 0.0314 | **0.0877** (+179%) | 0.254 -> 0.308 |
+| 768 | 0.0831 | **0.0955** | **+14.9%** | 0.0890 | 0.1091 (+22.6%) | 0.327 -> 0.352 |
+| 960 | 0.1077 | 0.1048 | **-2.7%** | 0.1187 | 0.1180 | 0.399 -> 0.389 |
+
+**The gain tracks the measured bias, which is the validation.** 640 had the
+largest inflation and gains most; 768 had roughly half and gains proportionally;
+960 had none and the correction slightly *hurts*, fitting noise where there is no
+signal. A spurious result would not behave this way.
+
+Calibrated 640 recovers from 53% to **76% of native-resolution mAP at 2.8x the
+speed** (0.0816 at 6.70 ms vs 0.1077 at 19.00 ms).
+
+**Apply at 640 and 768; do not apply at 960.** Constants are resolution-specific
+and must be re-fitted per engine, always on the train split - fitting them on the
+evaluation boxes would tune the correction on what it is then scored against.
+
+Remaining gap to 960 is the jitter component, which no calibration can address; a
+learned refinement head pooling features at the predicted box would be the next
+step, and `tracking/features.py:pool_box_features` already provides the pooling.
+
+---
+
+## 10. Early objectness probe (for selective token merging)
+
+`artifacts/results/early_objectness_960.json`, `scripts/early_objectness_probe.py`.
+
+Question: can anything identify background tokens *before* the last layer, so
+they can be merged early while object tokens stay at full resolution? OWLv2
+computes objectness only at the end. Candidates: the final objectness head
+applied to each intermediate block's features, and the previous video frame's
+final objectness. Merging simulated as 2x2 windows (window = max token score),
+lowest X% merged. An object "survives" if at least one token that detects it at
+the final layer (box IoU >= 0.5, class score >= 0.05) is in an unmerged window.
+Correctness gate: per-layer replication matches the real head exactly (0.0).
+
+299 frames / 299 videos, 960px, 829 detectable objects (171 undetectable even
+unmerged, excluded). Merging 25/50/75% of windows removes 19/38/56% of tokens.
+
+| Score | survive @25% | @50% | @75% |
+| --- | --- | --- | --- |
+| random | 0.829 | 0.600 | 0.346 |
+| blocks 0-6 | 0.91-1.00 | 0.77-0.91 | 0.48-0.60 |
+| block 7 | 0.999 | 0.970 | 0.824 |
+| **block 8** | **1.000** | **0.998** | **0.989** |
+| blocks 9-12 | 1.000 | 1.000 | 0.992-0.999 |
+| previous frame | 0.986 | 0.955 | 0.882 |
+| previous frame, dilated | 0.996 | 0.970 | 0.872 |
+| 5 frames back, dilated | 0.998 | 0.959 | 0.836 |
+
+- The head becomes reliable at **block 8**; earlier blocks lose 9-23% of objects
+  at 50% merge.
+- The previous frame ranks tokens closer to final than block 11 does (Spearman
+  0.884 vs 0.803) but still loses 3-5% of objects at 50% - motion and detection
+  flicker near threshold.
+- Rank correlation is a poor guide here (block 5: rho 0.26, survival 0.88);
+  survival is the decision metric.
+- Dilation helps at 50% but slightly hurts at 75%: a fixed budget spent on halos
+  around large objects leaves small ones exposed.
+- Stuff classes (floor/door/window/light/doorway) are not penalised relative to
+  things.
+
+Analytic compute estimate (not measured): merging only at block 8 saves ~16-22%
+of backbone FLOPs; a cascade (25% from block 1 via the previous frame, up to 75%
+at block 8) ~39% at an estimated 98-99% survival. Benchmark to beat: 768px +
+calibration, ~46% saved at mAP 0.0955.
+
+**Ceiling estimate only**: features are held fixed. Real merging changes the
+surviving tokens through attention; that needs an actual merging experiment.
+
+---
+
+## 11. Selective token merging, actual (not simulated)
+
+`artifacts/results/cascade_benchmark.json`, `scripts/cascade_benchmark.py`,
+`src/sggpipeline/detect/token_merging.py`.
+
+2x2 windows averaged into one token; proportional attention (log size added to
+key logits, folded into an extra head dimension so fused SDPA kernels still
+apply); unmerged before the heads. Gates: folded attention vs masked reference
+6e-7; rewritten forward vs real graph with merging off 0.0 at all resolutions.
+
+Schedules: `prev50` = 50% of windows before block 1 by previous-frame objectness
+(dilated); `b8_75` = 75% before block 9 by block-8 objectness; `cascade` = 25%
+early + up to 75% at block 8. 600 test frames, one per video, 36 classes,
+uncalibrated, eager fp16.
+
+| Res | Config | Compute vs 960 | Eager ms | mAP | mAP@75 | AP small | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 960 | none | 1.00 | 126.9 | 0.1200 | 0.1302 | 0.0219 | 0.4036 |
+| 960 | **prev50** | **0.52** | 71.5 | **0.1206** | **0.1319** | 0.0216 | 0.4032 |
+| 960 | b8_75 | 0.78 | 100.6 | 0.1124 | 0.1240 | 0.0207 | 0.3970 |
+| 960 | cascade | 0.61 | 84.2 | 0.1200 | 0.1314 | 0.0208 | 0.3934 |
+| 768 | none | 0.54 | 63.5 | 0.0912 | 0.0953 | 0.0122 | 0.3312 |
+| 640 | none | 0.34 | 34.0 | 0.0620 | 0.0366 | 0.0072 | 0.2555 |
+| 640 | prev50 | 0.19 | 27.7 | 0.0634 | 0.0372 | 0.0072 | 0.2506 |
+| 640 | b8_75 | 0.27 | 32.4 | 0.0537 | 0.0318 | 0.0065 | 0.2515 |
+| 640 | cascade | 0.22 | 30.5 | 0.0598 | 0.0326 | 0.0082 | 0.2526 |
+
+- **Early merging via the previous frame is lossless at 960** (0.52x compute,
+  mAP/AR within noise) and beats 768px at matched compute by +32% mAP, +38%
+  mAP@75, +22% AR, +77% AP small. Compressing background beats shrinking the image.
+- **Late merging hurts** (b8_75: -6% mAP at 960, -13% at 640); the cascade is not
+  better than prev50. This contradicts the probe-based prediction: the survival
+  metric treated merged windows as deleted (they still predict after unmerge)
+  and could not see feature damage from averaging specialised late tokens. Use
+  the probe to screen ideas, not to predict accuracy.
+- At 640 prev50 halves compute again at ~no mAP cost, but eager speedup is only
+  1.23x: bookkeeping dominates at 1,600 tokens.
+- Eager latency overstates merging overhead (960 prev50 71.5 ms vs 768 63.5 ms at
+  similar FLOPs); TensorRT latency unmeasured. prev50 keeps static shapes (fixed
+  2,251 tokens, indices supplied from outside), the easiest TRT case.
+- **Optimistic in one respect:** the prior came from an unmerged pass. In a stream
+  it comes from the previous *merged* pass, risking lock-in (an object that
+  appears in a merged region stays low-scored and merged). Needs a
+  consecutive-frame test and likely a periodic unmerged refresh.
+
+---
+
+## 12. Merge fraction sweep and streaming lock-in test
+
+`artifacts/results/merge_fraction_sweep.json`, `artifacts/results/merge_streaming_test.json`.
+
+### Fraction sweep (previous-frame prior, 600 frames, one per video)
+
+Eager latencies are within-run only: the GPU ran unthrottled here (960 unmerged
+30.2 ms vs 126.9 ms in section 11).
+
+| Res | Config | Compute | Eager ms | mAP | mAP@75 | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 960 | none | 1.00 | 30.2 | 0.1200 | 0.1302 | 0.4036 |
+| 960 | prev50 | 0.52 | 20.5 | 0.1206 | 0.1319 | 0.4032 |
+| 960 | prev60 | 0.44 | 18.1 | 0.1200 | 0.1302 | 0.3886 |
+| 960 | prev70 (dilated) | 0.37 | 14.9 | 0.1121 | 0.1218 | 0.3786 |
+| 960 | prev70 no dilation | 0.37 | 15.0 | 0.1215 | 0.1315 | 0.3900 |
+| 960 | prev80 | 0.29 | 13.7 | 0.1009 | 0.1078 | 0.3380 |
+| 640 | none | 0.34 | 11.1 | 0.0620 | 0.0366 | 0.2555 |
+| 640 | prev50 | 0.19 | 9.2 | 0.0634 | 0.0372 | 0.2506 |
+| 640 | prev70 no dilation | 0.14 | 7.2 | 0.0590 | 0.0349 | 0.2441 |
+
+Knee between 50% and 70%. Dilation hurts at 70% (budget spent on halos), as the
+probe predicted. Merged 960 at 0.37x compute has twice the mAP of plain 640 at
+0.34x.
+
+### Streaming (self-fed prior, consecutive frames)
+
+5,821 frames over 40 five-second segments at 960px. Pseudo-GT = unmerged
+detections >= 0.3; recall = same-class detection >= 0.1 at IoU >= 0.5. Measures
+loss relative to not merging, not absolute accuracy.
+
+| Config | Recall | New-object recall |
+| --- | --- | --- |
+| self-fed 50% | 0.994 | 0.973 |
+| clean prior 50% | 0.994 | 0.973 |
+| self-fed 70% no-dil | 0.971 | 0.926 |
+| clean prior 70% no-dil | 0.969 | 0.922 |
+
+No lock-in: self-fed equals clean-prior, and recall is flat across frames since
+refresh (1-5 through 61-149). No periodic refresh needed within 5 s; longer
+horizons untested. 70% misses ~1 in 14 newly appearing objects vs ~1 in 37 at 50%.
+
+**Decision: prev50 (dilated) for the engine** - lossless on every measure at 0.52x
+encoder compute.
+
+---
+
+## 13. prev50 merged TensorRT engine
+
+`artifacts/engines/base_merged50_fp16.plan`, `artifacts/results/verify_base_merged50.json`,
+`artifacts/results/merged_engine_benchmark.json`; code in
+`src/sggpipeline/detect/merged_export.py`, `scripts/build_merged_engine.py`,
+`scripts/merged_engine_benchmark.py`.
+
+Static graph: 2,251 tokens (450 of 900 windows merged) every frame; the merge plan
+enters as three int64 index inputs (`unmerged_idx` 1800, `member_patches` 450x4,
+`assign` 3600) computed outside the engine from the previous frame's objectness.
+Export graph matches eager `merged_forward` bit-exactly.
+
+**Verification** vs eager fp32, 8 real frames with real priors: logit cosine
+0.99967, detection match 0.980, mean IoU 0.975 - PASS. Engine 181 MB, 165 layers,
+**41.6 MB device memory**: fused attention survived (materialised scores at 2,251
+tokens would be ~120 MB for one layer).
+
+**Benchmark** (TensorRT fp16, same run, 600 frames one per video, 36 classes,
+uncalibrated, prior from the 960 engine on the previous frame):
+
+| Engine | Engine ms | p95 | Plan ms | Per-frame ms | FPS | mAP | mAP@75 | AP small | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 960 unmerged | 17.89 | 20.20 | - | 18.07 | 55.3 | 0.1193 | 0.1292 | 0.0213 | 0.4051 |
+| **960 merged50** | **14.26** | **15.42** | 0.38 | **15.10** | **66.2** | **0.1207** | **0.1324** | 0.0210 | **0.4038** |
+| 768 unmerged | 10.01 | 11.36 | - | 10.45 | 95.7 | 0.0917 | 0.0978 | 0.0120 | 0.3324 |
+| 640 unmerged | 6.55 | 7.28 | - | 7.00 | 142.8 | 0.0634 | 0.0379 | 0.0078 | 0.2551 |
+
+- Lossless in TensorRT, as in eager. Merge plan costs 0.38 ms.
+- **Only 20% faster despite 48% less encoder compute**: effective throughput fell
+  from ~61 to ~40 TFLOPS. Unprofiled. Leading hypothesis: the proportional-
+  attention fold (head dim 64 -> 72, per-layer concats) lands on a slower fused
+  kernel; secondary: input/output gathers blocking fusion.
+- Per-frame figures here use Charades' 480x270 frames, so preprocessing is far
+  cheaper than the 1080p figures in section 2.
+- The first frame of a stream has no prior: run the unmerged engine once (or use a
+  default plan). No refresh needed afterwards within the 5 s tested.
+
+---
+
+## 14. Kernel profile: where the merged engine's speedup went
+
+`artifacts/results/engine_kernel_profile.json`, `scripts/profile_engines.py`.
+Every CUDA kernel recorded via CUPTI (torch.profiler), 50 iterations, both 960
+engines in the same run.
+
+| Category | 960 unmerged | 960 merged50 | Ratio |
+| --- | --- | --- | --- |
+| GEMM (projections + MLP) | 8.97 ms (57 launches) | 6.22 ms (57) | 0.69 |
+| **Fused attention (`_gemm_mha_v2`)** | **7.09 ms (12)** | **7.19 ms (12)** | **1.01** |
+| Pointwise / norms / concats | 0.87 ms (43) | 1.04 ms (94) | 1.19 |
+| Total | 16.96 ms | 14.47 ms | 0.85 |
+
+- GEMMs scale as expected with tokens (0.69 vs 0.625 token ratio).
+- **Attention did not shrink at all**, though it should scale ~quadratically to
+  ~0.39x (~2.8 ms). Cause: the proportional-attention fold widens heads 64 -> 72;
+  the fused MHA kernel is ~2.5x slower per FLOP at that width. Its concats also
+  show as the extra pointwise launches.
+- Attention is 42% of the unmerged engine at 960, so this is most of the gap.
+  With standard 64-dim heads the merged engine is estimated at ~10 ms (the 768
+  engine's speed) - an estimate, not a measurement.
+- Fixes: drop proportional attention (fastest; accuracy must be re-measured) or
+  implement it as exact 4x key/value duplication with 64-dim heads (~0.625x
+  attention cost, accuracy unchanged by construction).
+
+---
+
+## 15. Not yet measured
+
+- Video decode throughput — `bench/streaming.py` written, never run. If CPU
+  decode caps below the engine's FPS, the resolution trade-off is moot.
+- Full 68,183-frame evaluation.
+- `large_int8`, `large_fp16`, `base_fp8`.
+- Padding-value A/B.
+- Calibration re-run against YOLO26 on the 14 shared classes (the normalized
+  comparison used uncalibrated OWLv2).
+- Learned box-refinement head for the residual jitter.
+- Merged engine without proportional attention (standard 64-dim heads).

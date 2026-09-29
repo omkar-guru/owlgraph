@@ -13,3 +13,6 @@ wheels/
 # Engines are specific to this GPU, driver and TensorRT version - rebuild, never commit.
 artifacts/
 acgdataset/
+
+# Model weights fetched by ultralytics into the working directory.
+*.pt

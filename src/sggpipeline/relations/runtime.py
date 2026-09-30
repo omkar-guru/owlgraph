@@ -16,7 +16,7 @@ import torch
 
 from ..ag.classes import AG_OBJECT_CLASSES
 from ..ag.relations import PREDICATES
-from .model import RelationshipHead, all_pair_geometry, predicate_probabilities
+from .model import RelationshipHead, all_pair_geometry
 from .sgdet import constrained_mask
 
 
@@ -78,7 +78,7 @@ class RelationshipPredictor:
         k = min(self.pair_budget, n * (n - 1))
         top = torch.topk(route.flatten(), k)
         si, oi = top.indices // n, top.indices % n
-        probs = predicate_probabilities(self.model.classify(subj[0, si], obj[0, oi], geo[0, si, oi]))
+        probs = self.model.probabilities(self.model.classify(subj[0, si], obj[0, oi], geo[0, si, oi]))
         host = torch.cat([si[:, None].float(), oi[:, None].float(),
                           torch.sigmoid(top.values)[:, None], probs], dim=1).cpu().numpy()
         return FrameRelations(host[:, 0].astype(np.int64), host[:, 1].astype(np.int64),

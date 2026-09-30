@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from .model import GROUP_SLICES, NUM_PREDICATES
+from .model import AG_SCHEMA, NUM_PREDICATES, PredicateSchema
 
 MATCH_IOU = 0.5
 
@@ -68,10 +68,33 @@ def pair_targets(match: torch.Tensor, gt_predicates: torch.Tensor):
     return positive, obj_predicates
 
 
-def constrained_mask(probs: torch.Tensor) -> torch.Tensor:
+def relation_map(gt_rels: torch.Tensor, g: int, p: int) -> torch.Tensor:
+    """(B, R, 3) padded relation rows -> (B, G, G, P) bool."""
+    b = gt_rels.shape[0]
+    out = torch.zeros(b, g, g, p, dtype=torch.bool, device=gt_rels.device)
+    bi, ri = torch.nonzero(gt_rels[:, :, 0] >= 0, as_tuple=True)
+    r = gt_rels[bi, ri]
+    out[bi, r[:, 0], r[:, 1], r[:, 2]] = True
+    return out
+
+
+def any_subject_targets(match: torch.Tensor, rel: torch.Tensor):
+    """Visual Genome targets, where any box can be the subject.
+
+    Detection pair (i, j) inherits every predicate of the ground-truth pairs
+    (s, o) with i matching s and j matching o. Returns ``positive`` (B, N, N)
+    and ``targets`` (B, N, N, P).
+    """
+    m = match.float()
+    via_subject = torch.einsum("bns,bsop->bnop", m, rel.float())
+    targets = torch.einsum("bmo,bnop->bnmp", m, via_subject) > 0
+    return targets.any(dim=-1), targets
+
+
+def constrained_mask(probs: torch.Tensor, schema: PredicateSchema = AG_SCHEMA) -> torch.Tensor:
     """Keep only each pair's best predicate per group (graph constraint)."""
     mask = torch.zeros_like(probs, dtype=torch.bool)
-    for sl in GROUP_SLICES.values():
+    for _, sl in schema.groups:
         best = probs[:, sl].argmax(dim=1) + sl.start
         mask[torch.arange(len(probs), device=probs.device), best] = True
     return mask

@@ -18,13 +18,15 @@ the frozen detector):
    label can still be scored. ``closed``: a fixed linear layer, the control that
    cannot score unseen predicates at all.
 
-Predicates follow Action Genome's three groups: attention (exactly one of 3,
-softmax), spatial (any of 6) and contacting (any of 17), both sigmoid.
+Predicates are described by a :class:`PredicateSchema`. Action Genome has three
+groups: attention (exactly one of 3, softmax), spatial (any of 6) and contacting
+(any of 17), both sigmoid. Visual Genome (VG150) has one group of 50, sigmoid.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -41,6 +43,30 @@ GROUP_SLICES = {
 }
 
 
+@dataclass(frozen=True)
+class PredicateSchema:
+    """A predicate vocabulary split into contiguous groups.
+
+    ``single`` groups hold exactly one true predicate per pair (softmax,
+    cross-entropy); the others are multi-label (sigmoid, BCE). The graph
+    constraint keeps one predicate per group.
+    """
+
+    names: tuple[str, ...]
+    groups: tuple[tuple[str, slice], ...]
+    single: frozenset[str] = frozenset()
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    @property
+    def multi_label(self) -> list[slice]:
+        return [sl for name, sl in self.groups if name not in self.single]
+
+
+AG_SCHEMA = PredicateSchema(tuple(PREDICATES), tuple(GROUP_SLICES.items()), frozenset({"attention"}))
+
+
 def all_pair_geometry(boxes: torch.Tensor, image_size: torch.Tensor) -> torch.Tensor:
     """(B, N, N, G) geometry of every ordered pair (subject i, object j)."""
     b, n, _ = boxes.shape
@@ -50,17 +76,18 @@ def all_pair_geometry(boxes: torch.Tensor, image_size: torch.Tensor) -> torch.Te
     return pair_geometry(subj, obj, size).reshape(b, n, n, GEOMETRY_DIM)
 
 
-def predicate_probabilities(logits: torch.Tensor) -> torch.Tensor:
-    """Softmax over attention, sigmoid over spatial and contacting."""
-    a = GROUP_SLICES["attention"]
-    return torch.cat([logits[..., a].softmax(dim=-1), logits[..., a.stop:].sigmoid()], dim=-1)
+def predicate_probabilities(logits: torch.Tensor, schema: PredicateSchema = AG_SCHEMA) -> torch.Tensor:
+    """Softmax within single-label groups, sigmoid elsewhere (AG: attention softmax)."""
+    return torch.cat([logits[..., sl].softmax(dim=-1) if name in schema.single else logits[..., sl].sigmoid()
+                      for name, sl in schema.groups], dim=-1)
 
 
 class RelationshipHead(nn.Module):
     def __init__(self, feature_dim: int, num_classes: int, predicate_embeds: torch.Tensor | None,
                  classifier: str = "text", hidden: int = 512, key_dim: int = 128,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, schema: PredicateSchema = AG_SCHEMA):
         super().__init__()
+        self.schema = schema
         if classifier not in ("text", "closed"):
             raise ValueError("classifier must be 'text' or 'closed'")
         if classifier == "text" and predicate_embeds is None:
@@ -82,10 +109,11 @@ class RelationshipHead(nn.Module):
             self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
             # One bias per group, never per predicate: a per-predicate bias would
             # learn each seen predicate's frequency and leave unseen ones at an
-            # arbitrary value, biasing any held-out comparison.
-            self.group_bias = nn.Parameter(torch.zeros(2))
+            # arbitrary value, biasing any held-out comparison. Softmax groups
+            # need none (a shared shift cancels).
+            self.group_bias = nn.Parameter(torch.zeros(len(schema.multi_label)))
         else:
-            self.closed = nn.Linear(hidden, NUM_PREDICATES)
+            self.closed = nn.Linear(hidden, len(schema))
 
     # -- per detection ---------------------------------------------------------
     def roles(self, features: torch.Tensor, labels: torch.Tensor):
@@ -100,40 +128,47 @@ class RelationshipHead(nn.Module):
 
     # -- classifier --------------------------------------------------------------
     def classify(self, subj: torch.Tensor, obj: torch.Tensor, geometry: torch.Tensor) -> torch.Tensor:
-        """(P, 26) predicate logits for P selected pairs."""
+        """(P, num_predicates) logits for P selected pairs."""
         h = self.trunk(subj + obj + self.geometry(geometry))
         if self.classifier == "closed":
             return self.closed(h)
         z = F.normalize(self.to_text(h), dim=-1)
         logits = self.logit_scale.exp() * z @ self.predicate_embeds.T
-        bias = torch.zeros(NUM_PREDICATES, device=logits.device, dtype=logits.dtype)
-        bias[GROUP_SLICES["spatial"]] = self.group_bias[0]
-        bias[GROUP_SLICES["contacting"]] = self.group_bias[1]
+        bias = torch.zeros(len(self.schema), device=logits.device, dtype=logits.dtype)
+        for value, sl in zip(self.group_bias, self.schema.multi_label):
+            bias[sl] = value
         return logits + bias
+
+    def probabilities(self, logits: torch.Tensor) -> torch.Tensor:
+        return predicate_probabilities(logits, self.schema)
 
 
 def classification_loss(logits: torch.Tensor, targets: torch.Tensor,
-                        seen: torch.Tensor | None = None) -> torch.Tensor:
-    """Attention cross-entropy plus spatial/contacting BCE, over seen predicates only.
+                        seen: torch.Tensor | None = None,
+                        schema: PredicateSchema = AG_SCHEMA) -> torch.Tensor:
+    """Cross-entropy per single-label group plus BCE over the multi-label ones,
+    over seen predicates only.
 
     Held-out predicates contribute no gradient anywhere: their columns are
-    dropped from the BCE, and a pair whose true attention predicate is held out
-    is dropped from the attention term, which is taken over seen columns only.
+    dropped from the BCE, and a pair whose true single-label predicate is held
+    out is dropped from that group's term, which is taken over seen columns only.
     """
     if seen is None:
-        seen = torch.ones(NUM_PREDICATES, dtype=torch.bool, device=logits.device)
-    a = GROUP_SLICES["attention"]
-    att_logits = logits[:, a].masked_fill(~seen[a], float("-inf"))
-    att_target = targets[:, a].float().argmax(dim=1)
-    keep = seen[a][att_target] & targets[:, a].any(dim=1)
+        seen = torch.ones(len(schema), dtype=torch.bool, device=logits.device)
     loss = logits.new_zeros(())
-    if keep.any():
-        loss = loss + F.cross_entropy(att_logits[keep], att_target[keep])
-    rest = slice(a.stop, NUM_PREDICATES)
-    cols = seen[rest]
+    for name, sl in schema.groups:
+        if name in schema.single:
+            group_logits = logits[:, sl].masked_fill(~seen[sl], float("-inf"))
+            group_target = targets[:, sl].float().argmax(dim=1)
+            keep = seen[sl][group_target] & targets[:, sl].any(dim=1)
+            if keep.any():
+                loss = loss + F.cross_entropy(group_logits[keep], group_target[keep])
+    multi = torch.zeros(len(schema), dtype=torch.bool, device=logits.device)
+    for sl in schema.multi_label:
+        multi[sl] = True
+    cols = multi & seen
     if cols.any():
-        loss = loss + F.binary_cross_entropy_with_logits(
-            logits[:, rest][:, cols], targets[:, rest][:, cols].float())
+        loss = loss + F.binary_cross_entropy_with_logits(logits[:, cols], targets[:, cols].float())
     return loss
 
 

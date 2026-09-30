@@ -51,30 +51,39 @@ PHRASES: dict[str, str] = {
     "writing_on": "writing on",
 }
 TEMPLATES = ("a person {} something", "a photo of a person {} an object", "someone {} a thing")
+# Visual Genome subjects are anything (a man, a window, a tree), so its
+# predicates - already plain phrases such as "parked on" - get neutral templates.
+GENERIC_TEMPLATES = ("something {} something", "a photo of an object {} another object",
+                     "a thing {} a thing")
 
 
-def predicate_prompts() -> tuple[list[str], np.ndarray]:
-    """All prompt strings, and the predicate index each belongs to."""
+def predicate_prompts(phrases: list[str] | None = None,
+                      templates: tuple[str, ...] = TEMPLATES) -> tuple[list[str], np.ndarray]:
+    """All prompt strings, and the predicate index each belongs to (AG by default)."""
+    if phrases is None:
+        phrases = [PHRASES[name] for name in PREDICATES]
     prompts, owner = [], []
-    for index, name in enumerate(PREDICATES):
-        for template in TEMPLATES:
-            prompts.append(template.format(PHRASES[name]))
+    for index, phrase in enumerate(phrases):
+        for template in templates:
+            prompts.append(template.format(phrase))
             owner.append(index)
     return prompts, np.asarray(owner)
 
 
 @torch.no_grad()
-def embed_predicates(model, processor, device: str = "cuda") -> np.ndarray:
-    """(26, D) unit-norm predicate embeddings: template embeddings averaged."""
+def embed_predicates(model, processor, device: str = "cuda", phrases: list[str] | None = None,
+                     templates: tuple[str, ...] = TEMPLATES) -> np.ndarray:
+    """(P, D) unit-norm predicate embeddings: template embeddings averaged."""
     from ..detect.owlv2 import encode_text_queries
 
-    prompts, owner = predicate_prompts()
+    prompts, owner = predicate_prompts(phrases, templates)
     embeds = encode_text_queries(model, processor, prompts, device).cpu().numpy()
-    out = np.stack([embeds[owner == i].mean(axis=0) for i in range(len(PREDICATES))])
+    out = np.stack([embeds[owner == i].mean(axis=0) for i in range(owner.max() + 1)])
     return (out / np.linalg.norm(out, axis=1, keepdims=True)).astype(np.float32)
 
 
-def load_or_build(cache: Path, device: str = "cuda") -> np.ndarray:
+def load_or_build(cache: Path, device: str = "cuda", phrases: list[str] | None = None,
+                  templates: tuple[str, ...] = TEMPLATES) -> np.ndarray:
     """Predicate embeddings from ``cache``, computing them once if missing."""
     cache = Path(cache)
     if cache.exists():
@@ -82,7 +91,7 @@ def load_or_build(cache: Path, device: str = "cuda") -> np.ndarray:
     from ..detect.owlv2 import load_owlv2
 
     model, processor = load_owlv2("base", device=device, dtype=torch.float32)
-    embeds = embed_predicates(model, processor, device)
+    embeds = embed_predicates(model, processor, device, phrases, templates)
     cache.parent.mkdir(parents=True, exist_ok=True)
     np.save(cache, embeds)
     return embeds

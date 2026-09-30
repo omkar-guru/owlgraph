@@ -38,10 +38,16 @@ from sggpipeline.vg.data import vocabulary
 
 PAIR_BUDGETS = (64, 128, 256, 512, None)  # None = every ordered pair
 
-# SG-ViT (Salzmann et al., ECCV 2024) on VG150 test, graph-constrained (Table 2).
-SGVIT_PUBLISHED = {"B/32": {"mR@50": 15.0, "mR@100": 18.1},
-                   "B/16": {"mR@50": 15.7, "mR@100": 19.3},
-                   "L/14": {"mR@50": 17.8, "mR@100": 21.8}}
+# SG-ViT (Salzmann et al., ECCV 2024) on VG150 test, in percent: graph-constrained
+# mean recall (Table 2); unconstrained recall and mean recall (Tables 8, 9).
+SGVIT_PUBLISHED = {
+    "B/32": {"wc mR@50": 15.0, "wc mR@100": 18.1, "nc R@20": 19.8, "nc R@50": 28.1, "nc R@100": 34.5,
+             "nc mR@50": 20.5, "nc mR@100": 24.8},
+    "B/16": {"wc mR@50": 15.7, "wc mR@100": 19.3, "nc R@20": 20.2, "nc R@50": 28.8, "nc R@100": 35.4,
+             "nc mR@50": 21.4, "nc mR@100": 26.6},
+    "L/14": {"wc mR@50": 17.8, "wc mR@100": 21.8, "nc R@20": 21.8, "nc R@50": 31.1, "nc R@100": 38.3,
+             "nc mR@50": 23.9, "nc mR@100": 29.5},
+}
 
 
 class Images:
@@ -221,8 +227,12 @@ def main() -> None:
     print(f"{name} VG150 PredCls: wc R@50 {pred['with_constraint/R@50']:.4f} R@100 "
           f"{pred['with_constraint/R@100']:.4f} mR@50 {pred['with_constraint/mR@50']:.4f} mR@100 "
           f"{pred['with_constraint/mR@100']:.4f}")
-    print("SG-ViT published (wc): " + ", ".join(f"{m} mR@50 {v['mR@50']} mR@100 {v['mR@100']}"
-                                                for m, v in SGVIT_PUBLISHED.items()))
+    ours = sgdet["all"]
+    print(f"ours (all pairs), %: " + ", ".join(
+        f"{k} {100 * ours[k.replace('wc ', 'with_constraint/').replace('nc ', 'no_constraint/')]:.1f}"
+        for k in SGVIT_PUBLISHED["B/16"]))
+    for m, v in SGVIT_PUBLISHED.items():
+        print(f"SG-ViT {m} published, %: " + ", ".join(f"{k} {x}" for k, x in v.items()))
     print("VG_RELATIONSHIPS_DONE", flush=True)
 
 

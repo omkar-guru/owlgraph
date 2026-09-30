@@ -279,7 +279,7 @@ def postprocess(
 
 
 @torch.no_grad()
-def postprocess_torch(
+def postprocess_device(
     pred_logits: torch.Tensor,
     pred_boxes: torch.Tensor,
     objectness: torch.Tensor,
@@ -289,13 +289,13 @@ def postprocess_torch(
     score_threshold: float = 0.05,
     max_detections: int = 100,
     nms_iou: float | None = None,
-) -> Detections:
-    """``postprocess`` on the tensors' own device, returning numpy detections.
+) -> torch.Tensor:
+    """``postprocess`` kept on the tensors' device, packed as one (K, 8) tensor.
 
-    Same semantics as the numpy reference (and tested against it), but on the GPU
-    only the surviving detections cross to the host instead of the full
-    3600 x prompts score grid. In the streaming detector the numpy path cost
-    ~2 ms/frame on the critical path, 60% of the merged engine's own time.
+    Columns: x1, y1, x2, y2, score, label, objectness, patch index. Packing lets
+    a caller bring everything to the host in a single copy - each separate
+    ``.cpu()`` is a device synchronisation, and on the streaming path those
+    waits were most of what postprocessing still cost.
     """
     logits = pred_logits.reshape(-1, pred_logits.shape[-1]).float()
     boxes = pred_boxes.reshape(-1, 4).float()
@@ -326,13 +326,35 @@ def postprocess_torch(
         kept = batched_nms(xyxy, score, label, nms_iou)[:max_detections]
         xyxy, score, label, patch = xyxy[kept], score[kept], label[kept], patch[kept]
 
+    # Labels (< 64) and patch indices (< 2^24) are exact in float32.
+    return torch.cat([xyxy, score[:, None], label[:, None].float(),
+                      torch.sigmoid(obj[patch])[:, None], patch[:, None].float()], dim=1)
+
+
+def unpack_detections(packed: np.ndarray) -> Detections:
+    """Host-side (K, 8) array from ``postprocess_device`` -> ``Detections``."""
+    packed = np.asarray(packed, dtype=np.float32).reshape(-1, 8)
     return Detections(
-        boxes=xyxy.cpu().numpy().astype(np.float32),
-        scores=score.cpu().numpy().astype(np.float32),
-        labels=label.cpu().numpy().astype(np.int64),
-        objectness=torch.sigmoid(obj[patch]).cpu().numpy().astype(np.float32),
-        patch_index=patch.cpu().numpy().astype(np.int64),
+        boxes=np.ascontiguousarray(packed[:, :4]),
+        scores=np.ascontiguousarray(packed[:, 4]),
+        labels=packed[:, 5].astype(np.int64),
+        objectness=np.ascontiguousarray(packed[:, 6]),
+        patch_index=packed[:, 7].astype(np.int64),
     )
+
+
+def postprocess_torch(pred_logits, pred_boxes, objectness, prompt_owner, num_classes,
+                      image_size, score_threshold: float = 0.05, max_detections: int = 100,
+                      nms_iou: float | None = None) -> Detections:
+    """``postprocess`` on the tensors' own device, returning numpy detections.
+
+    Same semantics as the numpy reference (and tested against it), but on the GPU
+    only the surviving detections cross to the host, in one copy, instead of the
+    full 3600 x prompts score grid.
+    """
+    packed = postprocess_device(pred_logits, pred_boxes, objectness, prompt_owner, num_classes,
+                                image_size, score_threshold, max_detections, nms_iou)
+    return unpack_detections(packed.cpu().numpy())
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:

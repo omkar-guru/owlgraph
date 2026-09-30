@@ -26,7 +26,7 @@ import torch
 
 from .fast_preprocess import GpuOwlv2Preprocessor
 from .merged_export import MergeIndexer
-from .owlv2 import Detections, postprocess_torch
+from .owlv2 import Detections, postprocess_device, unpack_detections
 from .trt_runner import TRTRunner
 
 PLAN_INPUTS = ("unmerged_idx", "member_patches", "assign")
@@ -94,24 +94,22 @@ class StreamingDetector:
         if self.merged is not None:
             self._prior = out["objectness"][0].float().clone()
 
-        # On the GPU, so only surviving detections cross to the host.
-        det = postprocess_torch(out["pred_logits"], out["pred_boxes"], out["objectness"],
-                                self.owner, self.num_classes, (width, height),
-                                self.score_threshold, self.max_detections, self.nms_iou)
-
+        # On the GPU; detections and their features then cross to the host in one
+        # copy, since every separate copy is another wait on the device.
+        packed = postprocess_device(out["pred_logits"], out["pred_boxes"], out["objectness"],
+                                    self.owner, self.num_classes, (width, height),
+                                    self.score_threshold, self.max_detections, self.nms_iou)
         # Clipping at the image border can collapse a box to zero width; later
         # stages require positive-area boxes, so such slivers are dropped here.
-        sides = det.boxes[:, 2:] - det.boxes[:, :2]
-        ok = (sides >= self.min_box_side).all(axis=1)
-        det = Detections(det.boxes[ok], det.scores[ok], det.labels[ok], det.objectness[ok],
-                         det.patch_index[ok])
+        sides = packed[:, 2:4] - packed[:, 0:2]
+        packed = packed[(sides >= self.min_box_side).all(dim=1)]
+        features = out["patch_features"][0].index_select(0, packed[:, 7].long()).float()
+        host = torch.cat([packed, features], dim=1).cpu().numpy()
+        det = unpack_detections(host[:, :8])
 
         if self.protect_score is not None:
             self._protect = det.boxes[det.scores >= self.protect_score]
-
-        index = torch.from_numpy(det.patch_index).to(out["patch_features"].device)
-        features = out["patch_features"][0].index_select(0, index).float().cpu().numpy()
-        return FrameResult(det, features, use_merged)
+        return FrameResult(det, np.ascontiguousarray(host[:, 8:]), use_merged)
 
     @staticmethod
     def _as_chw(frame) -> torch.Tensor:

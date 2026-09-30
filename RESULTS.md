@@ -517,9 +517,21 @@ logit cosine 0.99972.
 | 768 unmerged | 9.90 | 11.02 | 2.79 | 2.82 | 351.6 | 2.84 | 18% |
 | 640 unmerged | 6.44 | 7.47 | 1.67 | 1.68 | 585.5 | 1.71 | 11% |
 
-\*Likely a warm-up artifact (first engine measured; sustained slower than its
-4.95 ms per-frame time while every other engine sustained faster). Rerun before
-quoting.
+\*A benchmark-harness artifact, now confirmed and fixed: the producer allocated
+fresh page-locked memory per frame (`pin_memory()`), which the CPU cannot
+recycle while running ahead of the GPU. With buffers pinned once and reused
+(`stream_overhead_probe.py`, RTX 5090):
+
+| Engine | Per-frame pin | Pinned once, reused | Frames already on GPU |
+| --- | --- | --- | --- |
+| 960 unmerged | 7.76 ms (129 FPS) | **4.89 ms (204 FPS)** | 4.88 ms |
+| 960 merged | 12.91 ms (78 FPS) | **3.17 ms (316 FPS)** | 3.08 ms |
+
+So 960 unmerged really sustains ~204 FPS (31% of 16 ms), and per-frame pinning
+is erratic as well as slow. `speed_benchmark.py` now pins once. The laptop's
+1-2 ms sustained gap very likely has the same cause (not re-measured: the
+laptop GPU was throttled overnight). For Stage 2: decode into a fixed set of
+reusable pinned buffers, never allocate per frame.
 
 - fp16 roofline: laptop 41.9 TFLOPS (plugged in - not throttled), 5090 228.2
   TFLOPS (5.4x). Engine speedup laptop -> 5090 is only 3.7x: batch-1 kernels do

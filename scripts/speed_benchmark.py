@@ -116,11 +116,16 @@ def sustained_fps(runner, pre, query, indexer, frames, seed_objectness, seconds=
     """
     q: queue.Queue = queue.Queue(maxsize=16)
     stop = threading.Event()
+    # Page-locked once and reused. Calling pin_memory() per frame allocates fresh
+    # page-locked memory every time; when the CPU runs ahead of the GPU those
+    # buffers cannot be recycled, and on the 5090 that alone turned a 4.9 ms/frame
+    # engine into 7.8 ms/frame (stream_overhead_probe.py).
+    pinned = [f.pin_memory() for f in frames]
 
     def producer():
         i = 0
         while not stop.is_set():
-            q.put(frames[i % len(frames)].pin_memory())
+            q.put(pinned[i % len(pinned)])
             i += 1
 
     thread = threading.Thread(target=producer, daemon=True)

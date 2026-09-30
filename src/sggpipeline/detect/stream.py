@@ -26,7 +26,7 @@ import torch
 
 from .fast_preprocess import GpuOwlv2Preprocessor
 from .merged_export import MergeIndexer
-from .owlv2 import Detections, postprocess
+from .owlv2 import Detections, postprocess_torch
 from .trt_runner import TRTRunner
 
 PLAN_INPUTS = ("unmerged_idx", "member_patches", "assign")
@@ -60,7 +60,7 @@ class StreamingDetector:
         self.pre = GpuOwlv2Preprocessor(image_size, device=device)
         self.indexer = MergeIndexer(image_size // 16, fraction, dilate, device=device)
         self.query = torch.from_numpy(queries.embeds).to(device)
-        self.owner = queries.owner
+        self.owner = torch.as_tensor(queries.owner, device=device)
         self.num_classes = num_classes
         self.score_threshold = score_threshold
         self.nms_iou = nms_iou
@@ -86,11 +86,10 @@ class StreamingDetector:
         if self.merged is not None:
             self._prior = out["objectness"][0].float().clone()
 
-        arrays = {k: out[k].float().cpu().numpy()
-                  for k in ("pred_logits", "pred_boxes", "objectness")}
-        det = postprocess(arrays["pred_logits"], arrays["pred_boxes"], arrays["objectness"],
-                          self.owner, self.num_classes, (width, height),
-                          self.score_threshold, self.max_detections, self.nms_iou)
+        # On the GPU, so only surviving detections cross to the host.
+        det = postprocess_torch(out["pred_logits"], out["pred_boxes"], out["objectness"],
+                                self.owner, self.num_classes, (width, height),
+                                self.score_threshold, self.max_detections, self.nms_iou)
 
         # Clipping at the image border can collapse a box to zero width; later
         # stages require positive-area boxes, so such slivers are dropped here.

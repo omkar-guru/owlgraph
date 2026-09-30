@@ -72,5 +72,41 @@ class PostprocessTest(unittest.TestCase):
         self.assertEqual(det.patch_index.shape, (0,))
 
 
+class TorchPostprocessTest(unittest.TestCase):
+    """The GPU-capable path must reproduce the numpy reference exactly."""
+
+    def check(self, seed, **kwargs):
+        from sggpipeline.detect.owlv2 import postprocess_torch
+
+        logits, boxes, obj = raw_outputs(seed)
+        ref = postprocess(logits, boxes, obj, OWNER, NUM_CLASSES, (640, 480), **kwargs)
+        got = postprocess_torch(torch.from_numpy(logits), torch.from_numpy(boxes),
+                                torch.from_numpy(obj), torch.from_numpy(OWNER),
+                                NUM_CLASSES, (640, 480), **kwargs)
+        np.testing.assert_array_equal(got.patch_index, ref.patch_index)
+        np.testing.assert_array_equal(got.labels, ref.labels)
+        np.testing.assert_allclose(got.scores, ref.scores, rtol=1e-6)
+        np.testing.assert_allclose(got.boxes, ref.boxes, atol=1e-3)
+        np.testing.assert_allclose(got.objectness, ref.objectness, rtol=1e-5)
+
+    def test_matches_reference_without_nms(self):
+        for seed in range(10):
+            self.check(seed, score_threshold=0.05, max_detections=100)
+
+    def test_matches_reference_with_nms(self):
+        for seed in range(10):
+            self.check(seed, score_threshold=0.05, max_detections=50, nms_iou=0.5)
+
+    def test_empty(self):
+        from sggpipeline.detect.owlv2 import postprocess_torch
+
+        logits, boxes, obj = raw_outputs(0)
+        got = postprocess_torch(torch.from_numpy(logits - 50), torch.from_numpy(boxes),
+                                torch.from_numpy(obj), torch.from_numpy(OWNER),
+                                NUM_CLASSES, (640, 480))
+        self.assertEqual(len(got.scores), 0)
+        self.assertEqual(got.patch_index.shape, (0,))
+
+
 if __name__ == "__main__":
     unittest.main()

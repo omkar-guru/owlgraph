@@ -278,5 +278,62 @@ def postprocess(
     )
 
 
+@torch.no_grad()
+def postprocess_torch(
+    pred_logits: torch.Tensor,
+    pred_boxes: torch.Tensor,
+    objectness: torch.Tensor,
+    prompt_owner: torch.Tensor,
+    num_classes: int,
+    image_size: tuple[int, int],
+    score_threshold: float = 0.05,
+    max_detections: int = 100,
+    nms_iou: float | None = None,
+) -> Detections:
+    """``postprocess`` on the tensors' own device, returning numpy detections.
+
+    Same semantics as the numpy reference (and tested against it), but on the GPU
+    only the surviving detections cross to the host instead of the full
+    3600 x prompts score grid. In the streaming detector the numpy path cost
+    ~2 ms/frame on the critical path, 60% of the merged engine's own time.
+    """
+    logits = pred_logits.reshape(-1, pred_logits.shape[-1]).float()
+    boxes = pred_boxes.reshape(-1, 4).float()
+    obj = objectness.reshape(-1).float()
+    num_patches = logits.shape[0]
+    owner = prompt_owner.to(logits.device).expand(num_patches, -1)
+    class_scores = torch.full((num_patches, num_classes), float("-inf"), device=logits.device)
+    class_scores = class_scores.scatter_reduce(1, owner, torch.sigmoid(logits), reduce="amax")
+    best_score, best_class = class_scores.max(dim=1)
+
+    patch = torch.nonzero(best_score >= score_threshold).squeeze(1)
+    patch = patch[torch.argsort(best_score[patch], descending=True, stable=True)]
+    if nms_iou is None:
+        patch = patch[:max_detections]
+    score, label = best_score[patch], best_class[patch]
+
+    scale = preprocess_sizes(*image_size)
+    cx, cy, w, h = boxes[patch].unbind(-1)
+    xyxy = torch.stack([(cx - w / 2) * scale, (cy - h / 2) * scale,
+                        (cx + w / 2) * scale, (cy + h / 2) * scale], dim=1)
+    width, height = image_size
+    xyxy[:, 0::2] = xyxy[:, 0::2].clamp(0, width)
+    xyxy[:, 1::2] = xyxy[:, 1::2].clamp(0, height)
+
+    if nms_iou is not None:
+        from torchvision.ops import batched_nms
+
+        kept = batched_nms(xyxy, score, label, nms_iou)[:max_detections]
+        xyxy, score, label, patch = xyxy[kept], score[kept], label[kept], patch[kept]
+
+    return Detections(
+        boxes=xyxy.cpu().numpy().astype(np.float32),
+        scores=score.cpu().numpy().astype(np.float32),
+        labels=label.cpu().numpy().astype(np.int64),
+        objectness=torch.sigmoid(obj[patch]).cpu().numpy().astype(np.float32),
+        patch_index=patch.cpu().numpy().astype(np.int64),
+    )
+
+
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))

@@ -50,7 +50,8 @@ class StreamingDetector:
                  num_classes: int, image_size: int = 960, fraction: float = 0.5,
                  dilate: bool = True, score_threshold: float = 0.1,
                  nms_iou: float | None = 0.7, max_detections: int = 100,
-                 min_box_side: float = 1.0, device: str = "cuda"):
+                 min_box_side: float = 1.0, protect_score: float | None = 0.3,
+                 device: str = "cuda"):
         self.seed = TRTRunner(seed_engine, device=device)
         self.merged = TRTRunner(merged_engine, device=device) if merged_engine else None
         for runner in filter(None, (self.seed, self.merged)):
@@ -66,11 +67,17 @@ class StreamingDetector:
         self.nms_iou = nms_iou
         self.max_detections = max_detections
         self.min_box_side = min_box_side
+        # Windows inside the previous frame's detections at or above this score
+        # are merged last. On the full AG test split this recovered ~58% of
+        # merging's mAP loss (0.1043 -> 0.1064 vs 0.1079 unmerged), mostly on
+        # large plain objects. None disables it.
+        self.protect_score = protect_score
         self.reset()
 
     def reset(self) -> None:
         """Call between videos: the next frame is re-seeded with the unmerged engine."""
         self._prior = None
+        self._protect = None
 
     def __call__(self, frame) -> FrameResult:
         """``frame``: PIL image, HWC uint8 array, or CHW uint8 tensor."""
@@ -81,7 +88,8 @@ class StreamingDetector:
         use_merged = self.merged is not None and self._prior is not None
         feeds = {"pixel_values": px, "query_embeds": self.query}
         if use_merged:
-            feeds.update(zip(PLAN_INPUTS, self.indexer(self._prior)))
+            feeds.update(zip(PLAN_INPUTS, self.indexer(self._prior, self._protect,
+                                                       (width, height))))
         out = (self.merged if use_merged else self.seed).infer(feeds)
         if self.merged is not None:
             self._prior = out["objectness"][0].float().clone()
@@ -97,6 +105,9 @@ class StreamingDetector:
         ok = (sides >= self.min_box_side).all(axis=1)
         det = Detections(det.boxes[ok], det.scores[ok], det.labels[ok], det.objectness[ok],
                          det.patch_index[ok])
+
+        if self.protect_score is not None:
+            self._protect = det.boxes[det.scores >= self.protect_score]
 
         index = torch.from_numpy(det.patch_index).to(out["patch_features"].device)
         features = out["patch_features"][0].index_select(0, index).float().cpu().numpy()

@@ -703,7 +703,36 @@ detector with the bridge uses ~27% of the 16 ms budget.
 
 ---
 
-## 21. Not yet measured
+## 21. Protecting the previous frame's detections during merging
+
+`artifacts/results/merge_protection_eval.json`, `scripts/merge_protection_eval.py`.
+Full test split (68,183 frames), same protocol as section 18. The merge planner
+merges last any window whose centre lies inside one of the previous frame's
+detections at or above a score threshold; the budget stays 450 windows.
+
+| Merge planning | mAP | mAP@50 | mAP@75 | AP medium | AP large | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Unprotected | 0.1043 | 0.1480 | 0.1147 | 0.0769 | 0.1529 | 0.4039 |
+| **Protect boxes >= 0.30** | **0.1064** | **0.1503** | **0.1165** | 0.0770 | **0.1561** | 0.4045 |
+| Protect boxes >= 0.15 | 0.1062 | 0.1503 | 0.1164 | 0.0765 | 0.1560 | 0.4055 |
+| *960 unmerged* | *0.1079* | *0.1523* | *0.1182* | *0.0766* | *0.1589* | *0.4088* |
+
+- The unprotected run reproduces section 18 exactly (0.1043).
+- **Protection recovers ~58% of merging's mAP loss**: -3.3% -> -1.4% against
+  unmerged, and 53% of the large-object AP gap. Recall barely moves, so the
+  remaining recall gap has another cause.
+- Per class (unmerged / merged / protected): table 0.297 / 0.273 / 0.291, chair
+  0.137 / 0.127 / 0.133, laptop 0.376 / 0.368 / 0.372, bed 0.180 / 0.171 /
+  0.175, floor 0.098 / 0.077 / 0.084, person 0.568 / 0.549 / 0.553. Floor
+  recovers least, most likely because floor detections are often below the 0.3
+  threshold; the reason person recovers little is unexplained.
+- Cost in a stream is near zero: the previous frame's detections are that
+  frame's own output. `StreamingDetector` now protects boxes >= 0.3 by default
+  (`protect_score`).
+
+---
+
+## 22. Not yet measured
 
 - Video decode throughput — `bench/streaming.py` written, never run. If CPU
   decode caps below the engine's FPS, the resolution trade-off is moot.

@@ -697,9 +697,9 @@ zero bad feature rows.
 | Streaming detector, GPU postprocess (`postprocess_torch`) | **4.32** |
 
 GPU postprocessing (identical output to the numpy reference, tested on CPU and
-CUDA) cut the bridge's overhead from 1.96 to 1.21 ms. The rest is mostly several
-small device-to-host copies per frame that could be batched into one. The full
-detector with the bridge uses ~27% of the 16 ms budget.
+CUDA) cut the bridge's overhead from 1.96 to 1.21 ms. (A guess that the remainder was
+mostly separate device-to-host copies was tested and ruled out - see section
+23.) The full detector with the bridge uses ~27-28% of the 16 ms budget.
 
 ---
 
@@ -795,12 +795,31 @@ Alternating configurations in one run, 3 repeats each, frames on GPU:
 
 ---
 
-## 24. Not yet measured
+## 24. Open items
 
-- Video decode throughput — `bench/streaming.py` written, never run. If CPU
-  decode caps below the engine's FPS, the resolution trade-off is moot.
-- `large_int8`, `large_fp16`, `base_fp8`.
-- Padding-value A/B.
-- Calibration re-run against YOLO26 on the 14 shared classes (the normalized
-  comparison used uncalibrated OWLv2).
-- Learned box-refinement head for the residual jitter.
+Measured since the last revision of this list: decode throughput (single-thread
+360 FPS laptop / 582-651 FPS 5090 at 480x270, far above 60 FPS), the full test
+split (section 18), the pinned-memory streaming gap (section 16).
+
+**Next for the pair head (Stage 1 per plan.md)**
+- SGDet: run it on the streaming detector's own boxes instead of ground truth.
+- Open-vocabulary predicates: compare the pair embedding with predicate text
+  embeddings (plan.md's SG-ViT design) instead of fixed classifiers, with
+  held-out predicates.
+- Check the recall metrics line-for-line against published AG evaluation code
+  before comparing with any published number.
+
+**Detector**
+- `large_int8` / `large_fp16` / `base_fp8`: the 5090 has headroom (streaming
+  detector at ~28% of 16 ms) to afford a larger model if it is more accurate.
+- Protect low-confidence large detections (floor recovers least, section 21).
+- Profile the remaining ~1.2 ms streaming overhead (section 23).
+- Padding-value A/B (0.0 vs 0.5); calibrated OWLv2 vs YOLO26 on shared classes;
+  learned box-refinement head for residual jitter.
+
+**Identity (Stage 2)**
+- Baseline: conventional tracker with the streaming detector's features.
+- If identity becomes a priority: hand-label the ~640 videos with sustained
+  hard cases (section 19) as the test set; train on continuity labels.
+- Commit the pending Stage 2 files (`botsort.py`, its tests, `pyproject.toml`
+  / `uv.lock` changes) together, and declare `scipy` directly.

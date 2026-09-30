@@ -176,24 +176,31 @@ def _prepare_int8(args, variant, ws, src: Path, dst: Path) -> Path:
 
     pre = build_preprocessor(processor, device=args.device, fast=True)
 
-    images = [load_image(f.image_path) for f in ag.frames]
+    paths = [f.image_path for f in ag.frames]
     videos = {f.video_id for f in ag.frames}
     print(
-        f"calibrating on {len(images)} frames from {len(videos)} videos "
+        f"calibrating on {len(paths)} frames from {len(videos)} videos "
         f"in split {args.calib_split!r}"
     )
 
-    batch = pre(images)
-    pixel_values = (
-        batch.detach().float().cpu().numpy() if hasattr(batch, "detach") else np.asarray(batch)
-    )
+    def load_one(path) -> np.ndarray:
+        """One frame -> (1, 3, S, S) float32, loaded only when the calibrator asks.
+
+        Preprocessing the whole set up front holds it all in host memory - about
+        4 GB for 384 frames at 960px fp32, which crashed a 15 GB machine.
+        """
+        batch = pre([load_image(path)])
+        if hasattr(batch, "detach"):
+            batch = batch.detach().float().cpu().numpy()
+        return np.ascontiguousarray(batch, dtype=np.float32)
+
     queries = load_queries(ws, variant.checkpoint)
 
     # Record exactly what was calibrated on, so the claim of no overlap with the
     # evaluation split is auditable after the fact rather than taken on trust.
     from .pipeline import write_report
 
-    used = [f.frame_key for f in ag.frames if f.image_path][: len(images)]
+    used = [f.frame_key for f in ag.frames]
     write_report(
         {
             "variant": variant.name,
@@ -206,7 +213,7 @@ def _prepare_int8(args, variant, ws, src: Path, dst: Path) -> Path:
         ws.result(f"calibration_{variant.name}.json"),
     )
 
-    reader = CalibrationReader(pixel_values, queries.embeds)
+    reader = CalibrationReader(image_paths=paths, query_embeds=queries.embeds, loader=load_one)
     return to_int8_onnx(src, dst, reader, calibration_method=args.calib_method)
 
 

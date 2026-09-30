@@ -86,6 +86,7 @@ def cmd_extract_frames(args) -> None:
         one_based=not args.zero_based,
         image_format=args.format,
         overwrite=args.overwrite,
+        decoder_threads=args.decoder_threads,
     )
     _echo(summary)
 
@@ -522,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-videos", type=int, default=None,
                    help="cap videos decoded, spread evenly across the split")
     p.add_argument("--format", default="png", choices=["png", "jpg"])
+    p.add_argument("--decoder-threads", type=int, default=2,
+                   help="threads per video decoder; workers x threads must fit thread limits")
     p.add_argument("--zero-based", action="store_true",
                    help="treat AG frame numbers as 0-based (they are 1-based)")
     p.add_argument("--overwrite", action="store_true")

@@ -55,6 +55,7 @@ def extract_video(
     one_based: bool = True,
     image_format: str = "png",
     overwrite: bool = False,
+    decoder_threads: int = 2,
 ) -> ExtractionResult:
     """Decode one video and write the requested frames.
 
@@ -89,6 +90,10 @@ def extract_video(
         with av.open(str(video_path)) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
+            # FFmpeg defaults to one decoder thread per core. With many worker
+            # processes that multiplies past container thread limits (EAGAIN);
+            # parallelism comes from the workers, so each decoder stays small.
+            stream.codec_context.thread_count = decoder_threads
             for position, frame in enumerate(container.decode(stream)):
                 destination = targets.pop(position, None)
                 if destination is not None:
@@ -104,8 +109,9 @@ def extract_video(
 
 
 def _worker(job):
-    video_path, numbers, out_dir, one_based, image_format, overwrite = job
-    return extract_video(video_path, numbers, out_dir, one_based, image_format, overwrite)
+    video_path, numbers, out_dir, one_based, image_format, overwrite, threads = job
+    return extract_video(video_path, numbers, out_dir, one_based, image_format, overwrite,
+                         threads)
 
 
 def extract_all(
@@ -118,6 +124,7 @@ def extract_all(
     image_format: str = "png",
     overwrite: bool = False,
     progress: bool = True,
+    decoder_threads: int = 2,
 ) -> dict:
     """Extract every listed frame, one process per video."""
     from multiprocessing import Pool
@@ -128,7 +135,8 @@ def extract_all(
 
     videos_dir, frames_dir = Path(videos_dir), Path(frames_dir)
     jobs = [
-        (videos_dir / video, numbers, frames_dir / video, one_based, image_format, overwrite)
+        (videos_dir / video, numbers, frames_dir / video, one_based, image_format, overwrite,
+         decoder_threads)
         for video, numbers in sorted(grouped.items())
     ]
     workers = workers or max(1, (os.cpu_count() or 4) - 2)

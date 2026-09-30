@@ -732,7 +732,70 @@ detections at or above a score threshold; the budget stays 450 windows.
 
 ---
 
-## 22. Not yet measured
+## 22. First relationship (pair) head, PredCls
+
+`artifacts/results/pair_head_predcls.json`, `scripts/cache_pair_features.py`,
+`scripts/train_pair_head.py`, `src/sggpipeline/relations/pair_head.py`.
+
+Setting: ground-truth person and object boxes and object labels are given; only
+the 26 AG predicates are predicted (attention: one of 3; spatial: any of 6;
+contacting: any of 17). Frozen 960px detector features (768-dim), SG-ViT-style
+directed head (separate subject/object projections + relative geometry + object
+label), 15 epochs, model selection on 395 held-out *training* videos (21,019
+pairs), test scored once. Train 355,759 pairs; test 146,656 pairs in 56,923
+frames. Frames without a person box (~12% of AG pairs) are excluded.
+
+Feature correspondence: for 97% of ground-truth objects some patch's predicted
+box matches at IoU >= 0.5 (median best IoU 0.90), so the deployment descriptor
+(the matching patch) is available for nearly every object.
+
+| Variant | R@10 wc | R@20 wc | mR@10 wc | mR@20 wc | R@20 nc | mR@20 nc |
+| --- | --- | --- | --- | --- | --- | --- |
+| Frequency prior (no model) | 0.619 | 0.643 | 0.254 | 0.275 | 0.940 | 0.684 |
+| Geometry + label only | 0.652 | 0.677 | 0.343 | 0.369 | 0.953 | 0.767 |
+| **+ box-averaged features** | **0.705** | **0.733** | **0.410** | **0.443** | **0.967** | **0.834** |
+| + matched-patch features | 0.703 | 0.731 | 0.408 | 0.438 | 0.966 | 0.827 |
+
+wc = at most one predicate per group per pair; nc = all 26 compete. R = recall
+of true (pair, predicate) among the top K per frame, averaged over frames; mR =
+per-predicate recall averaged over predicates.
+
+- **Frozen detector features add real relationship information**: +5.6 pts
+  R@20 and **+7.4 pts mR@20 (+20% relative)** over the geometry+label control.
+  Largest per-predicate gains are visual interaction predicates: twisting
+  (+26 pts), writing on, wiping, lying on, carrying.
+- **The deployment descriptor loses almost nothing** against box averaging
+  (mR@20 0.438 vs 0.443), supporting the bridge's design.
+- AG's label priors are strong (frequency alone: R@20 0.643), which is why the
+  geometry-only control is the right comparison.
+- nc R@50 is ~1.0 for every variant (about 2.6 pairs x 26 predicates per frame
+  fits in 50 guesses) - saturated and uninformative, so not reported.
+- Metrics follow standard scene-graph definitions but have **not** been checked
+  line-for-line against published AG evaluation code; do not compare to
+  published numbers until they are.
+
+---
+
+## 23. Streaming detector cost, same-run A/B (RTX 5090)
+
+Alternating configurations in one run, 3 repeats each, frames on GPU:
+
+| Configuration | ms/frame (median) |
+| --- | --- |
+| Streaming detector, no box protection | 4.30 |
+| **Streaming detector, box protection (default)** | **4.53** |
+| Bare merged engine (section 20) | 3.08-3.14 |
+
+- Box protection costs 0.23 ms/frame for +2% mAP (section 21).
+- Packing detections and features into one host copy made **no measurable
+  difference** (4.30-4.39 vs 4.32 with separate copies); the remaining ~1.2 ms
+  bridge overhead is elsewhere, likely the many small GPU ops (selection, sort,
+  NMS) and their launch overhead. Unprofiled.
+- The full streaming detector uses ~28% of the 16 ms throughput budget.
+
+---
+
+## 24. Not yet measured
 
 - Video decode throughput — `bench/streaming.py` written, never run. If CPU
   decode caps below the engine's FPS, the resolution trade-off is moot.

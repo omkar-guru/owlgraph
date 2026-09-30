@@ -103,12 +103,12 @@ class StreamingDetector:
         # stages require positive-area boxes, so such slivers are dropped here.
         sides = packed[:, 2:4] - packed[:, 0:2]
         packed = packed[(sides >= self.min_box_side).all(dim=1)]
+        if self.protect_score is not None:
+            # Kept on the device: the next frame's plan is built there too.
+            self._protect = packed[packed[:, 4] >= self.protect_score, :4]
         features = out["patch_features"][0].index_select(0, packed[:, 7].long()).float()
         host = torch.cat([packed, features], dim=1).cpu().numpy()
         det = unpack_detections(host[:, :8])
-
-        if self.protect_score is not None:
-            self._protect = det.boxes[det.scores >= self.protect_score]
         return FrameResult(det, np.ascontiguousarray(host[:, 8:]), use_merged)
 
     @staticmethod

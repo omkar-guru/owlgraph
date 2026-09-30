@@ -86,6 +86,7 @@ class MergeIndexer:
         self.grid = WindowGrid(side, device)
         self.num_merged = round(fraction * self.grid.num_windows)
         self.dilate = dilate
+        self._centres: dict = {}
 
     def __call__(self, prior_objectness: torch.Tensor, protect_boxes=None,
                  image_size: tuple[int, int] | None = None):
@@ -114,11 +115,14 @@ class MergeIndexer:
         Windows tile the bottom/right-padded square the preprocessor builds, so a
         window spans ``max(width, height) / windows-per-side`` native pixels.
         """
-        half = self.grid.half
-        cell = max(image_size) / half
-        centres = (torch.arange(half, device=device, dtype=torch.float32) + 0.5) * cell
-        cy, cx = torch.meshgrid(centres, centres, indexing="ij")
-        cx, cy = cx.reshape(-1, 1), cy.reshape(-1, 1)
+        key = (max(image_size), str(device))
+        if key not in self._centres:  # a stream keeps one frame size; build once
+            half = self.grid.half
+            cell = max(image_size) / half
+            c = (torch.arange(half, device=device, dtype=torch.float32) + 0.5) * cell
+            cy, cx = torch.meshgrid(c, c, indexing="ij")
+            self._centres[key] = (cx.reshape(-1, 1), cy.reshape(-1, 1))
+        cx, cy = self._centres[key]
         b = torch.as_tensor(boxes, dtype=torch.float32, device=device).reshape(-1, 4)
         inside = (cx >= b[:, 0]) & (cx <= b[:, 2]) & (cy >= b[:, 1]) & (cy <= b[:, 3])
         return inside.any(dim=1)

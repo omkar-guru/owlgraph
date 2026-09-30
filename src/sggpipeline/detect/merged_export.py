@@ -38,9 +38,11 @@ OUTPUT_NAMES = ["pred_logits", "pred_boxes", "objectness"]
 class MergedDetectionGraph(nn.Module):
     """OWLv2 vision tower and heads with a fixed number of merged windows."""
 
-    def __init__(self, model, num_merged_windows: int, proportional: bool = True):
+    def __init__(self, model, num_merged_windows: int, proportional: bool = True,
+                 with_features: bool = False):
         super().__init__()
         self.model = model
+        self.with_features = with_features
         self.side = model.num_patches_height
         num_patches = self.side * self.side
         num_unmerged = num_patches - 4 * num_merged_windows
@@ -66,6 +68,10 @@ class MergedDetectionGraph(nn.Module):
         logits = self.model.class_predictor(feats, query_embeds.unsqueeze(0), None)[0]
         boxes = self.model.box_predictor(feats, fmap)
         objectness = self.model.objectness_predictor(feats)
+        if self.with_features:
+            # Unmerged per-patch features. Object patches are never merged under
+            # the chosen schedule, so detections read intact descriptors.
+            return logits, boxes, objectness, feats
         return logits, boxes, objectness
 
 
@@ -91,13 +97,14 @@ class MergeIndexer:
 
 def export_merged_onnx(model, num_prompts: int, image_size: int, fraction: float,
                        out_path: Path, opset: int = 17, device: str = "cuda",
-                       proportional: bool = True) -> Path:
+                       proportional: bool = True, with_features: bool = False) -> Path:
     """Trace the merged graph with static shapes, fp32, for later precision passes."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     side = model.num_patches_height
     indexer = MergeIndexer(side, fraction, device=device)
-    graph = MergedDetectionGraph(model, indexer.num_merged, proportional).eval().to(device)
+    graph = MergedDetectionGraph(model, indexer.num_merged, proportional,
+                                 with_features).eval().to(device)
 
     # Any valid plan traces the same graph; only the index *values* vary per frame.
     unmerged, members, assign = indexer(torch.rand(side * side, device=device))
@@ -109,7 +116,8 @@ def export_merged_onnx(model, num_prompts: int, image_size: int, fraction: float
     with torch.no_grad():
         torch.onnx.export(
             graph, (pixels, query, unmerged, members, assign), str(out_path),
-            input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
+            input_names=INPUT_NAMES,
+            output_names=OUTPUT_NAMES + (["patch_features"] if with_features else []),
             opset_version=opset, do_constant_folding=True, dynamo=False,
         )
     return out_path

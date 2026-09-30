@@ -26,6 +26,7 @@ def export_onnx(
     device: str = "cuda",
     batch_size: int = 1,
     native_image_size: int | None = None,
+    with_features: bool = False,
 ) -> Path:
     """Trace the detection graph to ONNX with fully static shapes.
 
@@ -42,7 +43,8 @@ def export_onnx(
         from .owlv2 import retarget_resolution
 
         retarget_resolution(model, image_size)
-    graph = Owlv2DetectionGraph(model, interpolate_pos_encoding=False).eval().to(device)
+    graph = Owlv2DetectionGraph(model, interpolate_pos_encoding=False,
+                                with_features=with_features).eval().to(device)
     embed_dim = model.config.text_config.hidden_size
 
     dummy_pixels = torch.randn(batch_size, 3, image_size, image_size, device=device)
@@ -55,7 +57,7 @@ def export_onnx(
             (dummy_pixels, dummy_query),
             str(out_path),
             input_names=INPUT_NAMES,
-            output_names=OUTPUT_NAMES,
+            output_names=OUTPUT_NAMES + (["patch_features"] if with_features else []),
             opset_version=opset,
             do_constant_folding=True,
             dynamo=False,

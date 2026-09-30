@@ -11,6 +11,12 @@ machine needs all of them rebuilt. This produces:
 
 plus the text-query cache the runners read. Existing engines are kept unless
 ``--rebuild`` is given.
+
+``--features`` also builds the two engines the streaming detector uses, which
+additionally output the per-patch features the heads read (``patch_features``):
+
+``base_feat_fp16.plan``              960px unmerged (seeds each stream)
+``base_merged50_np_feat_fp16.plan``  960px merged, the per-frame engine
 """
 
 from __future__ import annotations
@@ -42,6 +48,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifacts", default="artifacts")
     ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--features", action="store_true",
+                    help="also build the feature-exporting engines for streaming")
     args = ap.parse_args()
     ws = Workspace(Path(args.artifacts))
 
@@ -70,6 +78,21 @@ def main() -> None:
         fp32 = export_merged_onnx(model, num_prompts, 960, 0.5,
                                   ws.onnx("base_merged50_np_fp32.onnx"), proportional=False)
         build(ws, name, fp32)
+
+    if args.features:
+        name = "base_feat_fp16"
+        if needed(name):
+            model, _ = load_owlv2("base", device="cuda", dtype=torch.float32)
+            fp32 = export_onnx(model, num_prompts, 960, ws.onnx("base_feat_fp32.onnx"),
+                               with_features=True)
+            build(ws, name, fp32)
+        name = "base_merged50_np_feat_fp16"
+        if needed(name):
+            model, _ = load_owlv2("base", device="cuda", dtype=torch.float32)
+            fp32 = export_merged_onnx(model, num_prompts, 960, 0.5,
+                                      ws.onnx("base_merged50_np_feat_fp32.onnx"),
+                                      proportional=False, with_features=True)
+            build(ws, name, fp32)
 
 
 if __name__ == "__main__":

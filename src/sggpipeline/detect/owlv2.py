@@ -67,17 +67,20 @@ class Owlv2DetectionGraph(nn.Module):
     cleanly to ONNX and gives TensorRT a single static profile to optimize.
     """
 
-    def __init__(self, model, interpolate_pos_encoding: bool = False):
+    def __init__(self, model, interpolate_pos_encoding: bool = False,
+                 with_features: bool = False):
         super().__init__()
         self.model = model
         # Required whenever the input is not the checkpoint's native resolution:
         # the position embeddings are learned for a fixed patch grid and must be
         # resampled to the new one, or every patch is located wrongly.
         self.interpolate_pos_encoding = interpolate_pos_encoding
+        # Also return the per-patch features the heads read. Downstream stages
+        # (identity, pair head) branch from these, so exposing them costs one
+        # extra output instead of a second encoder.
+        self.with_features = with_features
 
-    def forward(
-        self, pixel_values: torch.Tensor, query_embeds: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor, query_embeds: torch.Tensor):
         # (B, H, W, D) grid of per-patch visual features.
         feature_map, _ = self.model.image_embedder(
             pixel_values=pixel_values,
@@ -98,6 +101,8 @@ class Owlv2DetectionGraph(nn.Module):
         # Class-agnostic objectness, useful for top-k pruning later in the pipeline.
         objectness = self.model.objectness_predictor(image_feats)
 
+        if self.with_features:
+            return pred_logits, pred_boxes, objectness, image_feats
         return pred_logits, pred_boxes, objectness
 
 
@@ -171,6 +176,9 @@ class Detections:
     scores: np.ndarray  # (N,)
     labels: np.ndarray  # (N,) class indices
     objectness: np.ndarray  # (N,)
+    # Patch that produced each detection. OWLv2 predicts one box per patch, so
+    # this row of the patch-feature map is that detection's own descriptor.
+    patch_index: np.ndarray | None = None  # (N,)
 
 
 def preprocess_sizes(width: int, height: int) -> float:
@@ -193,12 +201,17 @@ def postprocess(
     image_size: tuple[int, int],
     score_threshold: float = 0.05,
     max_detections: int = 100,
+    nms_iou: float | None = None,
 ) -> Detections:
     """Turn raw head outputs into per-class detections in original pixels.
 
     ``prompt_owner`` maps each text query back to its class, so a class written
     with several surface forms ("a cup" / "a glass" / "a bottle") is scored by
     its best-matching prompt rather than an arbitrary one.
+
+    ``nms_iou`` enables per-class duplicate suppression. Off by default so Stage 1
+    scores stay comparable; a tracker needs it, because below ~0.3 score about a
+    tenth of detections are same-class near-duplicates of another detection.
     """
     logits = np.asarray(pred_logits, dtype=np.float32).reshape(-1, pred_logits.shape[-1])
     boxes = np.asarray(pred_boxes, dtype=np.float32).reshape(-1, 4)
@@ -222,14 +235,18 @@ def postprocess(
     if not keep.any():
         empty_f = np.zeros((0, 4), dtype=np.float32)
         empty = np.zeros((0,), dtype=np.float32)
-        return Detections(empty_f, empty, np.zeros((0,), dtype=np.int64), empty)
+        empty_i = np.zeros((0,), dtype=np.int64)
+        return Detections(empty_f, empty, empty_i, empty, empty_i)
 
+    patch = np.flatnonzero(keep)
     boxes, best_score = boxes[keep], best_score[keep]
     best_class, obj = best_class[keep], _sigmoid(obj[keep])
 
-    order = np.argsort(-best_score)[:max_detections]
+    order = np.argsort(-best_score)
+    if nms_iou is None:
+        order = order[:max_detections]
     boxes, best_score = boxes[order], best_score[order]
-    best_class, obj = best_class[order], obj[order]
+    best_class, obj, patch = best_class[order], obj[order], patch[order]
 
     # cxcywh (normalized to the padded square) -> xyxy in native pixels.
     scale = preprocess_sizes(*image_size)
@@ -243,11 +260,21 @@ def postprocess(
     xyxy[:, 0::2] = xyxy[:, 0::2].clip(0, width)
     xyxy[:, 1::2] = xyxy[:, 1::2].clip(0, height)
 
+    if nms_iou is not None:
+        from torchvision.ops import batched_nms
+
+        # batched_nms returns indices in descending score order.
+        kept = batched_nms(torch.from_numpy(xyxy), torch.from_numpy(best_score),
+                           torch.from_numpy(best_class), nms_iou).numpy()[:max_detections]
+        xyxy, best_score, best_class = xyxy[kept], best_score[kept], best_class[kept]
+        obj, patch = obj[kept], patch[kept]
+
     return Detections(
         boxes=xyxy.astype(np.float32),
         scores=best_score.astype(np.float32),
         labels=best_class.astype(np.int64),
         objectness=obj.astype(np.float32),
+        patch_index=patch.astype(np.int64),
     )
 
 

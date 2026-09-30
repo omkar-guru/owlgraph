@@ -466,7 +466,40 @@ engines in the same run.
 
 ---
 
-## 15. Not yet measured
+## 15. Merged engine without proportional attention (current best)
+
+`artifacts/engines/base_merged50_np_fp16.plan`, `artifacts/results/verify_base_merged50_np.json`,
+`artifacts/results/merged_engine_benchmark.json`. Built with
+`scripts/build_merged_engine.py --no-proportional`: merged tokens attend as one
+token, heads keep their native 64-dim width. Graph shrinks from 1,854 to 596 ONNX
+nodes and 165 to 118 TensorRT layers; device memory 36.3 MB.
+
+Verification vs eager fp32 (same schedule, no proportional attention), 8 real
+frames: logit cosine 0.99972, detection match 0.979, mean IoU 0.971 - PASS.
+
+TensorRT fp16, same run, 600 frames one per video, 36 classes, uncalibrated:
+
+| Engine | Engine ms | p95 | Per-frame ms | FPS | mAP | mAP@75 | AP small | AR@100 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 960 unmerged | 17.74 | 20.05 | 17.49 | 57.2 | 0.1193 | 0.1292 | 0.0213 | 0.4051 |
+| 960 merged50 (proportional) | 14.51 | 15.16 | 14.93 | 67.0 | 0.1207 | 0.1324 | 0.0210 | 0.4038 |
+| **960 merged50, no proportional** | **10.29** | **10.70** | **10.70** | **93.4** | **0.1188** | **0.1306** | **0.0217** | **0.4036** |
+| 768 unmerged | 9.87 | 11.70 | 10.30 | 97.1 | 0.0917 | 0.0978 | 0.0120 | 0.3324 |
+| 640 unmerged | 6.35 | 7.84 | 6.92 | 144.4 | 0.0634 | 0.0379 | 0.0078 | 0.2551 |
+
+- **1.72x faster than unmerged 960 at unchanged accuracy** (all deltas within noise).
+  The profile-based estimate (~10 ms) held: fixing the attention width recovered
+  the missing speedup.
+- **Matches 768's speed with native-960 accuracy**: +30% mAP, +34% mAP@75, +81%
+  AP small, +21% AR, and a better p95 (10.70 vs 11.70 ms).
+- Proportional attention is unnecessary for this model: with vs without, mAP
+  0.1207 vs 0.1188 and AR 0.4038 vs 0.4036 are within noise.
+- Deployment: seed the first frame of a stream with one unmerged pass; the merged
+  engine then supplies its own prior (no refresh needed within 5 s, section 12).
+
+---
+
+## 16. Not yet measured
 
 - Video decode throughput — `bench/streaming.py` written, never run. If CPU
   decode caps below the engine's FPS, the resolution trade-off is moot.
@@ -476,4 +509,3 @@ engines in the same run.
 - Calibration re-run against YOLO26 on the 14 shared classes (the normalized
   comparison used uncalibrated OWLv2).
 - Learned box-refinement head for the residual jitter.
-- Merged engine without proportional attention (standard 64-dim heads).

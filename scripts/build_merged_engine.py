@@ -40,17 +40,20 @@ def main() -> None:
     ap.add_argument("--image-size", type=int, default=960)
     ap.add_argument("--fraction", type=float, default=0.5)
     ap.add_argument("--verify-frames", type=int, default=8)
+    ap.add_argument("--no-proportional", action="store_true",
+                    help="plain attention: merged tokens weighted as one token")
     args = ap.parse_args()
 
     ws = Workspace(Path(args.artifacts))
     queries = load_queries(ws, "base")
     query = torch.from_numpy(queries.embeds).cuda()
-    tag = f"base_merged{int(round(args.fraction * 100))}"
+    proportional = not args.no_proportional
+    tag = f"base_merged{int(round(args.fraction * 100))}" + ("" if proportional else "_np")
     model, _ = load_owlv2("base", device="cuda", dtype=torch.float32)
     side = model.num_patches_height
 
     fp32 = export_merged_onnx(model, len(queries.prompts), args.image_size, args.fraction,
-                              ws.onnx(f"{tag}_fp32.onnx"))
+                              ws.onnx(f"{tag}_fp32.onnx"), proportional=proportional)
     fp16 = to_fp16_onnx(fp32, ws.onnx(f"{tag}_fp16.onnx"))
     print("onnx:", json.dumps(summarize_quantization(fp16)))
 
@@ -82,7 +85,8 @@ def main() -> None:
                                grid)["objectness"][0].float()
         px = pre([image]).float()
         ref = merged_forward(model, px, query,
-                             MergePlan(early_fraction=args.fraction, early_scores=prior), grid)
+                             MergePlan(early_fraction=args.fraction, early_scores=prior,
+                                       proportional=proportional), grid)
         unmerged, members, assign = indexer(prior)
         out = runner.infer({"pixel_values": px, "query_embeds": query,
                             "unmerged_idx": unmerged, "member_patches": members,
@@ -105,6 +109,7 @@ def main() -> None:
     iou = float(np.mean([f["detections"]["mean_best_iou"] for f in per_frame]))
     passed = cos >= 0.999 and match >= 0.85
     write_report({"engine": str(engine_path), "fraction": args.fraction,
+                  "proportional_attention": proportional,
                   "mean_logit_cosine": cos, "mean_detection_match_rate": match,
                   "mean_best_iou": iou, "passed": passed, "per_frame": per_frame},
                  ws.result(f"verify_{tag}.json"))

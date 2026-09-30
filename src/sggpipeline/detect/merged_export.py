@@ -38,7 +38,7 @@ OUTPUT_NAMES = ["pred_logits", "pred_boxes", "objectness"]
 class MergedDetectionGraph(nn.Module):
     """OWLv2 vision tower and heads with a fixed number of merged windows."""
 
-    def __init__(self, model, num_merged_windows: int):
+    def __init__(self, model, num_merged_windows: int, proportional: bool = True):
         super().__init__()
         self.model = model
         self.side = model.num_patches_height
@@ -46,7 +46,10 @@ class MergedDetectionGraph(nn.Module):
         num_unmerged = num_patches - 4 * num_merged_windows
         # Token sizes depend only on the counts, never on which windows merged,
         # because plan_indices fixes the order. So they are a constant here.
-        self.register_buffer("log_sizes", token_sizes(num_unmerged, num_merged_windows).log())
+        # Without proportional attention there is no bias and heads keep their
+        # native width.
+        sizes = token_sizes(num_unmerged, num_merged_windows).log() if proportional else None
+        self.register_buffer("log_sizes", sizes)
 
     def forward(self, pixel_values, query_embeds, unmerged_idx, member_patches, assign):
         vision = self.model.owlv2.vision_model
@@ -87,13 +90,14 @@ class MergeIndexer:
 
 
 def export_merged_onnx(model, num_prompts: int, image_size: int, fraction: float,
-                       out_path: Path, opset: int = 17, device: str = "cuda") -> Path:
+                       out_path: Path, opset: int = 17, device: str = "cuda",
+                       proportional: bool = True) -> Path:
     """Trace the merged graph with static shapes, fp32, for later precision passes."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     side = model.num_patches_height
     indexer = MergeIndexer(side, fraction, device=device)
-    graph = MergedDetectionGraph(model, indexer.num_merged).eval().to(device)
+    graph = MergedDetectionGraph(model, indexer.num_merged, proportional).eval().to(device)
 
     # Any valid plan traces the same graph; only the index *values* vary per frame.
     unmerged, members, assign = indexer(torch.rand(side * side, device=device))

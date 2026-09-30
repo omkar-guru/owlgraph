@@ -35,6 +35,9 @@ class MergePlan:
     early_dilate: bool = True
     late_block: int | None = None  # merge before this block index (= after that many blocks)
     late_total_fraction: float = 0.0  # cumulative fraction merged after the late stage
+    # Weight a merged token as the four patches it replaces. Costs a wider
+    # attention head in the exported engine, which TensorRT runs much slower.
+    proportional: bool = True
 
 
 class WindowGrid:
@@ -184,7 +187,7 @@ def merged_forward(model, pixel_values, query, plan: MergePlan, grid: WindowGrid
                 window_merged[scores.argsort()[:extra]] = True
                 x, sizes, assign = compose(x[:, :1], x[:, assign], window_merged, grid)
         token_counts.append(x.shape[1])
-        log_sizes = None if sizes is None else sizes.log()
+        log_sizes = None if sizes is None or not plan.proportional else sizes.log()
         x = layer_forward(layer, x, log_sizes)
 
     # Unmerge: every patch gets its token back, restoring the fixed grid.

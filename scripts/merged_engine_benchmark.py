@@ -37,6 +37,7 @@ from early_objectness_probe import decode_positions
 ENGINES = {
     "960 unmerged": ("base_fp16.plan", 960, False),
     "960 merged50": ("base_merged50_fp16.plan", 960, True),
+    "960 merged50 np": ("base_merged50_np_fp16.plan", 960, True),
     "768 unmerged": ("base768_fp16.plan", 768, False),
     "640 unmerged": ("base640_fp16.plan", 640, False),
 }
@@ -138,12 +139,12 @@ def main() -> None:
                  ws.result("merged_engine_benchmark.json"))
 
     print(f"\n{len(frames)} frames, one per video, 36 classes, uncalibrated; TensorRT fp16\n")
-    h = (f"{'config':<14}{'engine':>9}{'p95':>7}{'index':>7}{'frame':>8}{'fps':>7}"
+    h = (f"{'config':<17}{'engine':>9}{'p95':>7}{'index':>7}{'frame':>8}{'fps':>7}"
          f"{'mAP':>8}{'mAP75':>8}{'APsmall':>8}{'AR100':>8}")
     print(h + "\n" + "-" * len(h))
     for r in rows:
         idx = f"{r['index_ms']['median']:.2f}" if r["index_ms"] else "-"
-        print(f"{r['config']:<14}{r['engine_ms']['median']:>9.2f}{r['engine_ms']['p95']:>7.2f}"
+        print(f"{r['config']:<17}{r['engine_ms']['median']:>9.2f}{r['engine_ms']['p95']:>7.2f}"
               f"{idx:>7}{r['per_frame_ms']['median']:>8.2f}"
               f"{1000 / r['per_frame_ms']['median']:>7.1f}{r['mAP']:>8.4f}{r['mAP_75']:>8.4f}"
               f"{r['mAP_small']:>8.4f}{r['AR_100']:>8.4f}")

@@ -7,8 +7,9 @@ measured, on what, and what the result does **not** support.
 **Hardware for all measurements below:** RTX 5070 Ti Laptop (sm_120, 12 GB),
 WSL2, 15 GB host RAM. torch 2.14.0+cu130, TensorRT 11.3.0.99, modelopt 0.46.1.
 **These numbers do not transfer to other hardware** — TensorRT engines are built
-per-GPU, and this one was measured at 46.9 TFLOPS peak fp16, likely
-power-throttled. Re-measure everywhere.
+per-GPU. This laptop GPU measures 41.9-46.9 TFLOPS peak fp16; that is its real
+capability, not throttling (re-measured plugged in, section 16). Re-measure on
+every new machine.
 
 Raw JSON for each is under `artifacts/results/`.
 
@@ -100,8 +101,9 @@ attention. Consequences, each measured rather than assumed:
 - **Structural sparsity: inert.** `BuilderFlag.SPARSE_WEIGHTS` exists but does
   nothing to dense weights; benefiting requires 2:4 pruning *and* fine-tuning.
 
-46.9 TFLOPS is low for this silicon (20–27 W drawn against a 120 W cap), so the
-GPU was likely power-throttled throughout. Treat all latency here as pessimistic.
+46.9 TFLOPS was first suspected to be power throttling; a later plugged-in
+re-measurement gave 41.9 TFLOPS with unchanged engine timings (section 16), so it
+is simply this laptop GPU's capability.
 
 ---
 
@@ -333,7 +335,7 @@ uncalibrated, eager fp16.
 | 640 | b8_75 | 0.27 | 32.4 | 0.0537 | 0.0318 | 0.0065 | 0.2515 |
 | 640 | cascade | 0.22 | 30.5 | 0.0598 | 0.0326 | 0.0082 | 0.2526 |
 
-- **Early merging via the previous frame is lossless at 960** (0.52x compute,
+- **Early merging via the previous frame is near-lossless at 960** *(Correction: on the full test split merging costs 3.3% mAP / 1.2% AR, concentrated in large low-texture objects - see section 18. The 600-frame samples could not resolve a gap that small.)* (0.52x compute,
   mAP/AR within noise) and beats 768px at matched compute by +32% mAP, +38%
   mAP@75, +22% AR, +77% AP small. Compressing background beats shrinking the image.
 - **Late merging hurts** (b8_75: -6% mAP at 960, -13% at 640); the cascade is not
@@ -395,7 +397,7 @@ No lock-in: self-fed equals clean-prior, and recall is flat across frames since
 refresh (1-5 through 61-149). No periodic refresh needed within 5 s; longer
 horizons untested. 70% misses ~1 in 14 newly appearing objects vs ~1 in 37 at 50%.
 
-**Decision: prev50 (dilated) for the engine** - lossless on every measure at 0.52x
+**Decision: prev50 (dilated) for the engine** - no measurable loss on 600 frames at 0.52x *(Correction: on the full test split merging costs 3.3% mAP / 1.2% AR, concentrated in large low-texture objects - see section 18. The 600-frame samples could not resolve a gap that small.)* -
 encoder compute.
 
 ---
@@ -427,7 +429,7 @@ uncalibrated, prior from the 960 engine on the previous frame):
 | 768 unmerged | 10.01 | 11.36 | - | 10.45 | 95.7 | 0.0917 | 0.0978 | 0.0120 | 0.3324 |
 | 640 unmerged | 6.55 | 7.28 | - | 7.00 | 142.8 | 0.0634 | 0.0379 | 0.0078 | 0.2551 |
 
-- Lossless in TensorRT, as in eager. Merge plan costs 0.38 ms.
+- No measurable loss on 600 frames in TensorRT, as in eager. *(Correction: on the full test split merging costs 3.3% mAP / 1.2% AR, concentrated in large low-texture objects - see section 18. The 600-frame samples could not resolve a gap that small.)* Merge plan costs 0.38 ms.
 - **Only 20% faster despite 48% less encoder compute**: effective throughput fell
   from ~61 to ~40 TFLOPS. Unprofiled. Leading hypothesis: the proportional-
   attention fold (head dim 64 -> 72, per-layer concats) lands on a slower fused
@@ -499,11 +501,118 @@ TensorRT fp16, same run, 600 frames one per video, 36 classes, uncalibrated:
 
 ---
 
-## 16. Not yet measured
+## 16. Speed on the laptop and on the RTX 5090
+
+`scripts/build_engines.py` (rebuild on a new GPU), `scripts/speed_benchmark.py`;
+`artifacts/results/speed_benchmark_*.json`. Charades 480x270 frames; no dataset
+needed. "Sustained" = decoder thread -> GPU preprocess -> engine back to back,
+the merged engine building each plan from its own previous output. Correctness
+gate (merged engine vs eager fp32, real consecutive frames) passed on both GPUs:
+logit cosine 0.99972.
+
+| Engine | Laptop engine ms | Laptop sustained ms/frame | 5090 engine ms | 5090 p99 | 5090 sustained FPS | 5090 ms/frame | 5090 share of 16 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 960 unmerged | 16.73 | 18.95 | 4.74 | 6.80 | 125.9* | 7.94* | 50%* |
+| **960 merged50 (np)** | **10.09** | **11.76** | **2.74** | **2.77** | **318.4** | **3.14** | **20%** |
+| 768 unmerged | 9.90 | 11.02 | 2.79 | 2.82 | 351.6 | 2.84 | 18% |
+| 640 unmerged | 6.44 | 7.47 | 1.67 | 1.68 | 585.5 | 1.71 | 11% |
+
+\*Likely a warm-up artifact (first engine measured; sustained slower than its
+4.95 ms per-frame time while every other engine sustained faster). Rerun before
+quoting.
+
+- fp16 roofline: laptop 41.9 TFLOPS (plugged in - not throttled), 5090 228.2
+  TFLOPS (5.4x). Engine speedup laptop -> 5090 is only 3.7x: batch-1 kernels do
+  not fill the larger GPU.
+- Merging stays 1.73x faster than unmerged at 960 on the 5090 (1.72x on the
+  laptop) and again matches 768's speed, so laptop comparisons transfer.
+- On the 5090 the current best detector uses ~20% of a 16 ms throughput budget,
+  leaving ~12.9 ms for downstream stages or a larger detector.
+- On the laptop, sustained streaming runs 1-2 ms/frame slower than isolated
+  per-frame timing (merged 11.76 vs 10.67 ms). Causes unconfirmed: per-frame
+  host sync in the merge planner (`nonzero`), per-frame pinned allocation,
+  Python overhead, heat under continuous load. The 5090 merged engine shows no
+  such gap (3.14 sustained vs 3.32 per-frame).
+- CPU side: single-thread decode 360 FPS (laptop) / 582 FPS (5090) at 480x270;
+  CPU postprocessing ~0.5-1.4 ms/frame.
+
+---
+
+## 17. Stage 2 readiness (review of `tracking/`)
+
+The Stage 2 code (association tracker, identity head, BoT-SORT adapter, cache
+format) is well built: 23 tests pass, identity is scoped per video, category
+labels are refused as identity supervision, ambiguous matches retire the old ID.
+Measured blockers and fixes:
+
+**Action Genome cannot evaluate identity.** Across all 288,782 annotated frames:
+zero frames with two visible objects of the same class, zero with two person
+boxes, and no instance IDs. The core identity case ("this cup vs an identical
+cup") has no test cases in AG; a tracked-instance subset is needed (plan.md
+anticipated this). Separately, 12% of AG object pairs sit in frames with no
+person box (the person detector missed), so they have no subject and are
+excluded from relationship work.
+
+**Raw detector output needs filtering before tracking** (200 test frames, 960px
+unmerged, no NMS):
+
+| Score threshold | Detections/frame | Same-class near-duplicates (IoU > 0.7) |
+| --- | --- | --- |
+| >= 0.05 (Stage 1 evaluation) | 64.9 | 16.0% |
+| >= 0.1 | 36.1 | 9.5% |
+| >= 0.3 | 6.9 | 0.4% |
+
+`postprocess(..., nms_iou=...)` now provides per-class suppression; the default
+path is unchanged (bit-identical on 50 random frames).
+
+**Assignment speed.** The tracker's pure-Python Hungarian solver took 3.66 ms at
+32x32 and 40.3 ms at 100x100; SciPy returns the identical result in 0.035 / 0.21
+ms. Swapped (tested against exhaustive search). scipy currently arrives via
+nvidia-modelopt and should be declared directly.
+
+**Container thread limit.** On the 5090 VM (pids.max 2,816), 90 extraction
+workers each running FFmpeg's default one-thread-per-core decoder failed with
+EAGAIN. Decoders are now capped at 2 threads (`--decoder-threads`); the rerun
+extracted all 288,777 frames with zero errors.
+
+---
+
+## 18. Full test-split evaluation (definitive Stage 1 accuracy)
+
+`artifacts/results/full_split_eval.json`, `scripts/full_split_eval.py`. Every AG
+test keyframe with a previous video frame: **68,183 frames from all 1,814 test
+videos**. 36 classes, uncalibrated, TensorRT fp16 on the RTX 5090; merged prior
+from the 960 unmerged engine on the previous frame. Inference 32.6 min; COCO
+scoring ~7 min per engine.
+
+| Engine | mAP | mAP@50 | mAP@75 | AP small | AR@100 |
+| --- | --- | --- | --- | --- | --- |
+| 960 unmerged | 0.1079 | 0.1523 | 0.1182 | 0.0118 | 0.4088 |
+| 960 merged (50%, plain attention) | 0.1043 | 0.1480 | 0.1147 | 0.0120 | 0.4039 |
+| 768 unmerged | 0.0822 | 0.1491 | 0.0824 | 0.0091 | 0.3359 |
+| 640 unmerged | 0.0546 | 0.1414 | 0.0256 | 0.0046 | 0.2561 |
+
+- **Merging is not lossless**: -3.3% mAP, -2.8% mAP@50, -1.2% AR against
+  unmerged 960. Earlier 600-frame runs showed differences within noise and were
+  reported as lossless; the full split resolves a real, small gap.
+- **The loss is concentrated in large, low-texture objects**: largest per-class
+  AP drops are table (-0.024), floor (-0.021), person (-0.019), chair, bed,
+  laptop; small objects are flat or slightly up (dish, clothes, sandwich,
+  phone). Consistent with interior windows of big uniform surfaces scoring low
+  objectness and being merged. Candidate fix (untested): also protect windows
+  inside the previous frame's confident detections, not only high-objectness
+  patches.
+- **The decision holds**: at the same speed, merged 960 beats 768 by +27% mAP,
+  +39% mAP@75, +32% AP small and +20% AR.
+- Subsample estimates were close for every engine (e.g. 960 unmerged 0.1077 on
+  1,200 frames vs 0.1079 here), so the earlier resolution conclusions stand.
+
+---
+
+## 19. Not yet measured
 
 - Video decode throughput — `bench/streaming.py` written, never run. If CPU
   decode caps below the engine's FPS, the resolution trade-off is moot.
-- Full 68,183-frame evaluation.
 - `large_int8`, `large_fp16`, `base_fp8`.
 - Padding-value A/B.
 - Calibration re-run against YOLO26 on the 14 shared classes (the normalized

@@ -37,6 +37,12 @@ class FrameResult:
     detections: Detections  # native-pixel boxes, with patch_index
     features: np.ndarray  # (K, D) float32, row i describes detection i
     merged: bool  # False for the seeding frame
+    # The same detections and features still on the GPU, so heads running there
+    # (relationships) need not copy them back: packed rows are x1, y1, x2, y2,
+    # score, label, objectness, patch index.
+    device_packed: torch.Tensor | None = None
+    device_features: torch.Tensor | None = None
+    image_size: tuple[int, int] | None = None
 
 
 class StreamingDetector:
@@ -109,7 +115,8 @@ class StreamingDetector:
         features = out["patch_features"][0].index_select(0, packed[:, 7].long()).float()
         host = torch.cat([packed, features], dim=1).cpu().numpy()
         det = unpack_detections(host[:, :8])
-        return FrameResult(det, np.ascontiguousarray(host[:, 8:]), use_merged)
+        return FrameResult(det, np.ascontiguousarray(host[:, 8:]), use_merged,
+                           packed, features, (width, height))
 
     @staticmethod
     def _as_chw(frame) -> torch.Tensor:

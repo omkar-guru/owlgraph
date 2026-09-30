@@ -72,7 +72,7 @@ def extract_video(
     skipped = 0
     for position, number in wanted.items():
         destination = out_dir / f"{number:06d}.{image_format}"
-        if destination.exists() and not overwrite:
+        if destination.exists() and not overwrite and _complete(destination, image_format):
             skipped += 1
             continue
         targets[position] = destination
@@ -98,7 +98,13 @@ def extract_video(
                 destination = targets.pop(position, None)
                 if destination is not None:
                     image: Image.Image = frame.to_image()
-                    image.save(destination)
+                    # Write-then-rename: an interrupted run must never leave a
+                    # partial file, because resuming skips files that exist. A
+                    # killed extraction once left truncated PNGs that resume
+                    # then treated as done.
+                    partial = destination.with_name(destination.name + ".partial")
+                    image.save(partial, format=image_format.upper().replace("JPG", "JPEG"))
+                    os.replace(partial, destination)
                     written += 1
                 if position >= last_needed:
                     break
@@ -106,6 +112,28 @@ def extract_video(
         return ExtractionResult(video_path.name, written, skipped, len(targets), str(exc))
 
     return ExtractionResult(video_path.name, written, skipped, len(targets))
+
+
+_PNG_TRAILER = b"IEND\xaeB`\x82"
+
+
+def _complete(path: Path, image_format: str) -> bool:
+    """False for a truncated PNG (every complete PNG ends with its IEND chunk).
+
+    Lets a resumed run re-extract frames a killed run left half-written, instead
+    of skipping them because the file exists.
+    """
+    if image_format != "png":
+        return True
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() < len(_PNG_TRAILER):
+                return False
+            fh.seek(-len(_PNG_TRAILER), os.SEEK_END)
+            return fh.read() == _PNG_TRAILER
+    except OSError:
+        return False
 
 
 def _worker(job):

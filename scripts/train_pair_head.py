@@ -122,11 +122,14 @@ def train_variant(train: dict, val: dict, feature: str | None, epochs: int, seed
         score = m["with_constraint/mR@20"]
         history.append({"epoch": epoch + 1, "train_loss": total / n,
                         "val_R@20": m["with_constraint/R@20"], "val_mR@20": score})
-        if score > best:
+        # A NaN score (empty validation set, e.g. in a tiny smoke run) never wins,
+        # so fall back to the final epoch rather than to no checkpoint at all.
+        if np.isfinite(score) and score > best:
             best, best_state = score, {k: v.detach().clone() for k, v in model.state_dict().items()}
         print(f"  {feature or 'geometry_label'} epoch {epoch + 1:2d} loss {total / n:.4f} "
               f"val R@20 {m['with_constraint/R@20']:.4f} mR@20 {score:.4f}", flush=True)
-    model.load_state_dict(best_state)
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return model, history
 
 

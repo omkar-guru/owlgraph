@@ -87,12 +87,41 @@ class MergeIndexer:
         self.num_merged = round(fraction * self.grid.num_windows)
         self.dilate = dilate
 
-    def __call__(self, prior_objectness: torch.Tensor):
+    def __call__(self, prior_objectness: torch.Tensor, protect_boxes=None,
+                 image_size: tuple[int, int] | None = None):
+        """Merge plan from the previous frame's objectness.
+
+        ``protect_boxes`` (xyxy native pixels, with ``image_size``) are the
+        previous frame's confident detections: windows whose centre lies inside
+        one are merged last. Patch objectness alone scores the interior of big
+        plain surfaces (a tabletop, the floor) as background; on the full test
+        split that is where merging's accuracy loss concentrated. The budget is
+        fixed by the engine's static shape, so protection reorders which
+        windows merge and never changes how many.
+        """
         scores = self.grid.window_max(prior_objectness.reshape(-1), self.dilate)
+        if protect_boxes is not None and len(protect_boxes):
+            protected = self.windows_inside(protect_boxes, image_size, scores.device)
+            scores = torch.where(protected, scores + 1e4, scores)
         window_merged = torch.zeros(self.grid.num_windows, dtype=torch.bool,
                                     device=scores.device)
         window_merged[scores.argsort()[: self.num_merged]] = True
         return plan_indices(window_merged, self.grid)
+
+    def windows_inside(self, boxes, image_size: tuple[int, int], device) -> torch.Tensor:
+        """(W,) mask of windows whose centre lies inside any box.
+
+        Windows tile the bottom/right-padded square the preprocessor builds, so a
+        window spans ``max(width, height) / windows-per-side`` native pixels.
+        """
+        half = self.grid.half
+        cell = max(image_size) / half
+        centres = (torch.arange(half, device=device, dtype=torch.float32) + 0.5) * cell
+        cy, cx = torch.meshgrid(centres, centres, indexing="ij")
+        cx, cy = cx.reshape(-1, 1), cy.reshape(-1, 1)
+        b = torch.as_tensor(boxes, dtype=torch.float32, device=device).reshape(-1, 4)
+        inside = (cx >= b[:, 0]) & (cx <= b[:, 2]) & (cy >= b[:, 1]) & (cy <= b[:, 3])
+        return inside.any(dim=1)
 
 
 def export_merged_onnx(model, num_prompts: int, image_size: int, fraction: float,

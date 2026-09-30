@@ -609,7 +609,47 @@ scoring ~7 min per engine.
 
 ---
 
-## 19. Not yet measured
+## 19. How often is identity a real problem? (same-class survey)
+
+`artifacts/results/same_class_mining.json`, `scripts/mine_same_class.py`. All
+9,600 AG videos (train + test) sampled at 1 frame/s: 289,861 frames, 960px
+unmerged engine, detections >= 0.3 with same-class NMS at 0.5. "Separate" = two
+same-class boxes with IoU < 0.1. "Movable" excludes fixed furniture and fittings
+(bed, chair, closet/cabinet, door, doorknob, doorway, floor, light, mirror,
+picture, refrigerator, shelf, sofa/couch, table, television, window).
+"Touching a person" = overlaps a person box, a proxy for interaction.
+
+| Situation | Share of sampled seconds | Share of videos |
+| --- | --- | --- |
+| >= 2 same-class detections | 64.7% | - |
+| >= 2 clearly separate same-class objects | 57.9% | 93.4% (>= 3 s: 77.3%; >= 10 s: 48.7%) |
+| ...of a movable class | 32.1% | - |
+| ...movable and touching a person | **4.2%** | 31.0% (**>= 3 s: 6.7%**) |
+
+Top movable classes touching a person: shoe (3,134 sampled seconds), clothes
+(1,802), cup/glass/bottle (1,721), pillow (1,430), box (1,004), bag (960),
+paper/notebook (706), towel (639), phone/camera (591).
+
+- **Spot check** of 12 saved examples: most are genuine multiple instances (two
+  cups while drinking, a bag in hand plus one on the wall, paper in hand plus
+  papers on the table, pillows, clothes on a rack); a few are doubtful (one
+  blanket split into two boxes, tiny towel boxes). Rates are broadly real but
+  somewhat inflated, and the person-overlap proxy also counts worn items
+  (shoes, clothes), which are not identity confusion.
+- **Conclusion: identity confusion is real but a minority case.** Same-class
+  coexistence is common, but mostly fixed objects that position alone separates.
+  The hard case lasts >= 3 s in only 6.7% of videos. The relationship head, needed
+  on every frame and evaluable on AG, should come first; identity can start from
+  the conventional tracker with detector features as the baseline.
+- **Asset:** the ~640 videos with sustained hard cases (`per_video` in the JSON)
+  are the pool to hand-label for an identity test set if identity becomes a
+  priority, instead of labelling at random.
+- Caveats: detector counts, not ground truth; 1 frame/s sampling; crude
+  interaction proxy.
+
+---
+
+## 20. Not yet measured
 
 - Video decode throughput — `bench/streaming.py` written, never run. If CPU
   decode caps below the engine's FPS, the resolution trade-off is moot.

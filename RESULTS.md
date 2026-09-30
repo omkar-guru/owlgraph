@@ -661,7 +661,49 @@ paper/notebook (706), towel (639), phone/camera (591).
 
 ---
 
-## 20. Not yet measured
+## 20. Stage 1 -> Stage 2 bridge (per-detection features, streaming detector)
+
+`src/sggpipeline/detect/stream.py`, `scripts/verify_bridge.py`,
+`artifacts/results/verify_bridge_NVIDIA_GeForce_RTX_5090.json`.
+
+Engines optionally export the 768-dim per-patch features the heads read
+(`patch_features`); each detection's descriptor is the row of the patch that
+produced it. (The 512-dim class embedding was rejected: it is trained to match
+category names, the wrong signal for telling identical objects apart.)
+`StreamingDetector` seeds each stream with the unmerged engine, then runs the
+merged engine with self-fed plans, per-class NMS, and feature gather.
+
+**Correctness** (RTX 5090, TensorRT fp16 vs eager fp32, 8 real frames; mean
+cosine):
+
+| Engine | logits | boxes | objectness | patch_features |
+| --- | --- | --- | --- | --- |
+| 960 unmerged + features | 0.99974 | 0.99985 | 0.99969 | 0.99991 |
+| 960 merged + features | 0.99973 | 0.99984 | 0.99961 | 0.99988 |
+| merged + features vs merged without | 0.99998 | 1.0 | 1.0 | - |
+
+Adding the output leaves detections unchanged.
+
+**Stream sanity** over 720 frames (717 merged): 33.2 detections/frame at score
+>= 0.1 with NMS 0.7; zero same-class pairs above IoU 0.7, zero degenerate boxes,
+zero bad feature rows.
+
+**Cost** (sustained, frames on GPU, decode excluded):
+
+| | ms/frame |
+| --- | --- |
+| Bare merged engine | 3.08-3.11 |
+| Streaming detector, numpy postprocess | 5.04 |
+| Streaming detector, GPU postprocess (`postprocess_torch`) | **4.32** |
+
+GPU postprocessing (identical output to the numpy reference, tested on CPU and
+CUDA) cut the bridge's overhead from 1.96 to 1.21 ms. The rest is mostly several
+small device-to-host copies per frame that could be batched into one. The full
+detector with the bridge uses ~27% of the 16 ms budget.
+
+---
+
+## 21. Not yet measured
 
 - Video decode throughput — `bench/streaming.py` written, never run. If CPU
   decode caps below the engine's FPS, the resolution trade-off is moot.

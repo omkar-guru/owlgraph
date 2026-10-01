@@ -119,3 +119,59 @@ def load_or_build_classes(cache: Path, classes: tuple[str, ...], device: str = "
     cache.parent.mkdir(parents=True, exist_ok=True)
     np.save(cache, out)
     return out
+
+
+# Text encoders tried for predicate phrases. OWLv2's own tower was trained on
+# object noun phrases and barely separates predicates (mean cosine 0.90 across
+# AG's 26); sentence encoders are trained to tell phrases apart.
+PREDICATE_ENCODERS = {
+    "owlv2": "google/owlv2-base-patch16-ensemble",
+    "mpnet": "sentence-transformers/all-mpnet-base-v2",
+    "bge": "BAAI/bge-large-en-v1.5",
+    "clip-l": "openai/clip-vit-large-patch14",
+}
+
+
+@torch.no_grad()
+def encode_phrases(encoder: str, prompts: list[str], device: str = "cuda") -> np.ndarray:
+    """(N, D) unit-norm embeddings of ``prompts`` from one of PREDICATE_ENCODERS."""
+    model_id = PREDICATE_ENCODERS[encoder]
+    if encoder == "owlv2":
+        from ..detect.owlv2 import encode_text_queries, load_owlv2
+
+        model, processor = load_owlv2(model_id, device=device, dtype=torch.float32)
+        return encode_text_queries(model, processor, prompts, device).cpu().numpy()
+    if encoder == "clip-l":
+        from transformers import CLIPTextModelWithProjection, CLIPTokenizer
+
+        tok = CLIPTokenizer.from_pretrained(model_id)
+        model = CLIPTextModelWithProjection.from_pretrained(model_id).to(device).eval()
+        out = model(**tok(prompts, padding=True, return_tensors="pt").to(device)).text_embeds
+    else:
+        from transformers import AutoModel, AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModel.from_pretrained(model_id).to(device).eval()
+        batch = tok(prompts, padding=True, truncation=True, return_tensors="pt").to(device)
+        hidden = model(**batch).last_hidden_state
+        if encoder == "bge":  # bge pools with its CLS token
+            out = hidden[:, 0]
+        else:  # sentence-transformers mpnet: attention-masked mean
+            mask = batch["attention_mask"][..., None].float()
+            out = (hidden * mask).sum(1) / mask.sum(1)
+    return torch.nn.functional.normalize(out.float(), dim=-1).cpu().numpy()
+
+
+def load_or_build_encoder(cache: Path, encoder: str, phrases: list[str] | None = None,
+                          templates: tuple[str, ...] = TEMPLATES, device: str = "cuda") -> np.ndarray:
+    """Template-averaged predicate embeddings from any PREDICATE_ENCODERS entry."""
+    cache = Path(cache)
+    if cache.exists():
+        return np.load(cache)
+    prompts, owner = predicate_prompts(phrases, templates)
+    embeds = encode_phrases(encoder, prompts, device)
+    out = np.stack([embeds[owner == i].mean(axis=0) for i in range(owner.max() + 1)])
+    out = (out / np.linalg.norm(out, axis=1, keepdims=True)).astype(np.float32)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache, out)
+    return out

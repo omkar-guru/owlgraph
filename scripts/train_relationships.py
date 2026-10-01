@@ -48,16 +48,26 @@ from sggpipeline.pipeline import Workspace, load_queries, write_report
 from sggpipeline.relations.model import (
     RelationshipHead, all_pair_geometry, classification_loss, predicate_probabilities,
     router_loss)
-from sggpipeline.relations.predicates import class_embeddings, load_or_build
+from sggpipeline.relations.predicates import (
+    PREDICATE_ENCODERS, class_embeddings, load_or_build, load_or_build_encoder)
 from sggpipeline.relations.sgdet import SGRecall, match_matrix, pair_targets
 
 HOLDOUTS = {"none": (), "four": ("drinking_from", "lying_on", "wiping", "beneath")}
 OBJECT_HOLDOUTS = {"none": (), "four": ("laptop", "pillow", "broom", "mirror")}
 
 
-def variant_name(classifier: str, holdout: str, labels: str = "text", holdout_objects: str = "none") -> str:
+def variant_name(classifier: str, holdout: str, labels: str = "text", holdout_objects: str = "none",
+                 encoder: str = "owlv2", seed: int = 0) -> str:
     return (f"rel_{classifier}_{holdout}" + ("_idlabel" if labels == "id" else "")
-            + ("" if holdout_objects == "none" else f"_obj{holdout_objects}"))
+            + ("" if holdout_objects == "none" else f"_obj{holdout_objects}")
+            + ("" if encoder == "owlv2" else f"_pe{encoder}") + ("" if seed == 0 else f"_s{seed}"))
+
+
+def predicate_embeddings(ws, encoder: str = "owlv2") -> np.ndarray:
+    """AG predicate phrase embeddings from the chosen text encoder."""
+    if encoder == "owlv2":
+        return load_or_build(ws.cache("predicate_embeds_base.npy"))
+    return load_or_build_encoder(ws.cache(f"predicate_embeds_{encoder}.npy"), encoder)
 
 
 def ag_class_embeddings(ws) -> np.ndarray:
@@ -190,6 +200,8 @@ def main() -> None:
     ap.add_argument("--holdout", choices=sorted(HOLDOUTS), default="none")
     ap.add_argument("--labels", choices=["text", "id"], default="text")
     ap.add_argument("--holdout-objects", choices=sorted(OBJECT_HOLDOUTS), default="none")
+    ap.add_argument("--predicate-encoder", choices=sorted(PREDICATE_ENCODERS), default="owlv2")
+    ap.add_argument("--no-test", action="store_true", help="train and save only; skip test scoring")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -199,7 +211,8 @@ def main() -> None:
     device = "cuda"
     torch.manual_seed(args.seed)
     ws = Workspace(Path(args.artifacts))
-    name = variant_name(args.classifier, args.holdout, args.labels, args.holdout_objects)
+    name = variant_name(args.classifier, args.holdout, args.labels, args.holdout_objects,
+                        args.predicate_encoder, args.seed)
 
     load = lambda p: dict(np.load(p, allow_pickle=False))  # noqa: E731
     train_np = load(ws.root / "sgdet" / "train.npz")
@@ -222,7 +235,7 @@ def main() -> None:
     seen = torch.ones(len(PREDICATES), dtype=torch.bool, device=device)
     for p in HOLDOUTS[args.holdout]:
         seen[PREDICATES.index(p)] = False
-    embeds = torch.from_numpy(load_or_build(ws.cache("predicate_embeds_base.npy"))).to(device)
+    embeds = torch.from_numpy(predicate_embeddings(ws, args.predicate_encoder)).to(device)
     class_embeds = torch.from_numpy(ag_class_embeddings(ws)) if args.labels == "text" else None
     model = RelationshipHead(768, len(AG_OBJECT_CLASSES), embeds, classifier=args.classifier,
                              class_embeds=class_embeds).to(device)
@@ -248,6 +261,9 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
     torch.save(model.state_dict(), ws.root / "sgdet" / f"{name}.pt")
+    if args.no_test:
+        print(f"{name}: saved (test scoring skipped)\nRELATIONSHIPS_DONE", flush=True)
+        return
 
     seen_np = seen.cpu().numpy() if args.holdout != "none" else None
     sgdet = {("all" if k is None else k): acc.summary(seen_np) for k, acc in evaluate(model, test).items()}

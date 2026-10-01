@@ -77,6 +77,10 @@ def map_over(probs, targets, rows, min_pos: int = 10) -> tuple[float, int]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifacts", default="artifacts")
+    ap.add_argument("--predicate-runs", nargs="+", default=None,
+                    help="held-out-predicate checkpoints to score (default: the section-25 set)")
+    ap.add_argument("--skip-objects", action="store_true")
+    ap.add_argument("--out", default="relationships_heldout_ranking.json")
     args = ap.parse_args()
     ws = Workspace(Path(args.artifacts))
     load = lambda p: dict(np.load(p, allow_pickle=False))  # noqa: E731
@@ -93,29 +97,31 @@ def main() -> None:
         path = ws.root / "sgdet" / f"{name}.pt"
         return load_relationship_head(path, len(AG_OBJECT_CLASSES), embeds, classifier) if path.exists() else None
 
-    # 1. Held-out predicates (heads trained with per-class label vectors).
-    for classifier in ("text", "closed"):
-        for holdout in ("none", "four"):
-            name = f"rel_{classifier}_{holdout}_idlabel"
-            model = head(name, classifier)
-            if model is None:
-                continue
-            probs, targets, _ = pair_probabilities(model, data)
-            ap_ = np.array([average_precision(probs[:, p], targets[:, p]) for p in range(len(PREDICATES))])
-            chance = targets.mean(axis=0)
-            report[name] = {"per_predicate_ap": dict(zip(PREDICATES, ap_.tolist())),
-                            "mAP_seen": float(np.nanmean(ap_[seen])),
-                            "mAP_held_out_four": float(np.nanmean(ap_[held])),
-                            "chance_per_held_out": dict(zip(HOLDOUTS["four"], chance[held].tolist())),
-                            "pairs": len(targets)}
-            print(f"{name:<26} mAP seen {report[name]['mAP_seen']:.3f}  held-out predicates "
-                  f"{report[name]['mAP_held_out_four']:.3f}  ("
-                  + ", ".join(f"{PREDICATES[p]} {ap_[p]:.3f} vs chance {chance[p]:.3f}" for p in held)
-                  + ")", flush=True)
+    # 1. Held-out predicates.
+    runs = args.predicate_runs or [f"rel_{c}_{h}_idlabel" for c in ("text", "closed") for h in ("none", "four")]
+    for name in runs:
+        classifier = "closed" if name.startswith("rel_closed") else "text"
+        model = head(name, classifier)
+        if model is None:
+            continue
+        probs, targets, _ = pair_probabilities(model, data)
+        ap_ = np.array([average_precision(probs[:, p], targets[:, p]) for p in range(len(PREDICATES))])
+        chance = targets.mean(axis=0)
+        report[name] = {"per_predicate_ap": dict(zip(PREDICATES, ap_.tolist())),
+                        "mAP_seen": float(np.nanmean(ap_[seen])),
+                        "mAP_held_out_four": float(np.nanmean(ap_[held])),
+                        "chance_per_held_out": dict(zip(HOLDOUTS["four"], chance[held].tolist())),
+                        "pairs": len(targets)}
+        print(f"{name:<26} mAP seen {report[name]['mAP_seen']:.3f}  held-out predicates "
+              f"{report[name]['mAP_held_out_four']:.3f}  ("
+              + ", ".join(f"{PREDICATES[p]} {ap_[p]:.3f} vs chance {chance[p]:.3f}" for p in held)
+              + ")", flush=True)
 
     # 2. Held-out objects: predicates of pairs whose object class was never trained on.
     hidden = np.array([AG_OBJECT_CLASSES.index(c) for c in OBJECT_HOLDOUTS["four"]])
-    for name in ("rel_text_none", "rel_text_none_objfour", "rel_text_none_idlabel_objfour"):
+    object_runs = () if args.skip_objects else ("rel_text_none", "rel_text_none_objfour",
+                                                 "rel_text_none_idlabel_objfour")
+    for name in object_runs:
         model = head(name)
         if model is None:
             continue
@@ -135,7 +141,7 @@ def main() -> None:
                           "average precision over all pairs, or over pairs grouped by object class "
                           "(predicates with >= 10 positives); chance = positive rate; held-out objects: "
                           + ", ".join(OBJECT_HOLDOUTS["four"]))
-    write_report(report, ws.result("relationships_heldout_ranking.json"))
+    write_report(report, ws.result(args.out))
     print("HELDOUT_RANKING_DONE", flush=True)
 
 

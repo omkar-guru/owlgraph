@@ -205,6 +205,8 @@ def load_relationship_head(path, num_classes: int, predicate_embeds: torch.Tenso
                            schema: PredicateSchema = AG_SCHEMA, device: str = "cuda") -> RelationshipHead:
     """Rebuild a saved head, text-label or learned-label, from its state dict."""
     state = torch.load(path, map_location=device, weights_only=True)
+    # A text classifier stores the predicate embeddings it was trained with (any encoder).
+    predicate_embeds = state.get("predicate_embeds", predicate_embeds)
     model = RelationshipHead(768, num_classes, predicate_embeds, classifier=classifier, schema=schema,
                              class_embeds=state.get("class_embeds"))
     model.load_state_dict(state)

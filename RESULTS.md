@@ -1031,7 +1031,41 @@ carrying the predicate). Chance (positive rate) 0.021.
 - Routing and role features use the detector's best label; only the final score
   is per query. Conditioning the head on the queried class is untested.
 
-## 30. Open items
+## 30. Other text encoders for open-vocabulary predicates
+
+Section 25 traced weak predicate transfer to OWLv2's text tower (predicate
+phrases at mean cosine 0.90). Same protocol, four encoders for the predicate
+embeddings (`relations/predicates.py: PREDICATE_ENCODERS`,
+`scripts/predicate_encoders.py`), text object labels, four predicates held out,
+**two seeds each**, held-out AP on PredCls test pairs (`scripts/heldout_ranking.py`):
+
+| Encoder (mean cosine of the 26) | Held-out mean AP | drinking_from (chance 0.010) | lying_on (0.009) | wiping (0.002) | beneath (0.168) | Seen mAP |
+| --- | --- | --- | --- | --- | --- | --- |
+| OWLv2-B/16 text (0.90) | 0.119 / 0.115 | 0.006 / 0.007 | 0.022 / 0.026 | 0.004 / 0.004 | 0.443 / 0.423 | 0.506 / 0.493 |
+| all-mpnet-base-v2 (0.52) | 0.074 / 0.070 | **0.037 / 0.040** | 0.034 / 0.034 | 0.001 / 0.001 | 0.223 / 0.204 | 0.486 / 0.502 |
+| bge-large-en-v1.5 (0.81) | **0.137 / 0.138** | 0.021 / 0.023 | 0.036 / 0.034 | 0.001 / 0.001 | **0.488 / 0.493** | 0.479 / 0.485 |
+| CLIP ViT-L/14 text (0.81) | 0.064 / 0.052 | 0.017 / 0.019 | 0.053 / 0.031 | 0.001 / 0.001 | 0.186 / 0.156 | 0.481 / 0.477 |
+| Closed control | 0.082 / 0.051 | 0.007 / 0.023 | 0.033 / 0.007 | 0.004 / 0.001 | 0.283 / 0.173 | 0.540 / 0.535 |
+
+For scale: trained on them, drinking_from reaches 0.735 AP, lying_on ~0.2,
+wiping ~0.02, beneath ~0.9 (section 25).
+
+- **Separation is not the whole story.** mpnet separates phrases most and is the
+  only encoder to lift the clearest action, drinking_from, to ~4x chance - but
+  it loses most of beneath. bge is best on average and on beneath, and lifts
+  drinking_from and lying_on to 2-4x chance. CLIP-L text does worst.
+- **Seeds agree for text encoders** (within ~0.01 mean); the closed control's
+  untrained columns swing (0.082 vs 0.051), as expected.
+- **Zero-shot predicate transfer stays weak in absolute terms**: the best
+  held-out action AP is ~0.04 against 0.735 when trained; wiping never
+  transfers. A defensible claim is "limited zero-shot transfer, mainly spatial".
+- **The text classifier costs ~0.04-0.05 seen-predicate mAP against the closed
+  one**, now consistent across four encoders and two seeds (0.48-0.51 vs
+  0.54).
+- Mean cosine after centring was computed too and discarded: subtracting the
+  mean of 26 vectors forces it to about -1/25 for any encoder.
+
+## 31. Open items
 
 Measured since the last revision of this list: the full relationship head on
 Action Genome, its deployed cost, VG150 against SG-ViT, detection failure
@@ -1040,8 +1074,10 @@ analysis and the large detector (sections 24-29).
 **Relationship head** (done: router, text/closed classifiers, SGDet and
 PredCls, budget sweep, held-out predicates and objects, stream timing - sections
 24-29)
-- Open-vocabulary predicates are unsupported so far (section 25): try
-  verb-aware predicate embeddings (sentence encoder or larger text tower).
+- Open-vocabulary predicates: zero-shot transfer is weak with every encoder
+  tried (section 30; bge best). Next: few-shot - how many labelled examples a
+  new predicate needs - and a hybrid classifier (closed for seen predicates,
+  text for new ones) to avoid the ~0.04 seen-mAP cost.
 - Mean recall: predicate rebalancing / reweighting (SG-ViT's rebalanced row:
   19.3 -> 26.1 mR@100 on VG150).
 - Condition the head on the *queried* class at retrieval time (section 29

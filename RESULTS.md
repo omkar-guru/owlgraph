@@ -9,7 +9,8 @@ WSL2, 15 GB host RAM. torch 2.14.0+cu130, TensorRT 11.3.0.99, modelopt 0.46.1.
 **These numbers do not transfer to other hardware** — TensorRT engines are built
 per-GPU. This laptop GPU measures 41.9-46.9 TFLOPS peak fp16; that is its real
 capability, not throttling (re-measured plugged in, section 16). Re-measure on
-every new machine.
+every new machine. Later sections name their hardware where it matters; the
+relationship-head work (sections 22-29) ran on an RTX 5090 (Vast.ai).
 
 Raw JSON for each is under `artifacts/results/`.
 
@@ -795,23 +796,266 @@ Alternating configurations in one run, 3 repeats each, frames on GPU:
 
 ---
 
-## 24. Open items
+## 24. Relationship head, full (router + predicate classifier), Action Genome
 
-Measured since the last revision of this list: decode throughput (single-thread
-360 FPS laptop / 582-651 FPS 5090 at 480x270, far above 60 FPS), the full test
-split (section 18), the pinned-memory streaming gap (section 16).
+plan.md's relationship head, end to end on the frozen detector's own boxes
+(`relations/model.py`, `scripts/train_relationships.py`):
 
-**Next for the pair head (Stage 1 per plan.md)**
-- SGDet: run it on the streaming detector's own boxes instead of ground truth.
-- Open-vocabulary predicates: compare the pair embedding with predicate text
-  embeddings (plan.md's SG-ViT design) instead of fixed classifiers, with
-  held-out predicates.
-- Check the recall metrics line-for-line against published AG evaluation code
-  before comparing with any published number.
+- Top 32 detections per keyframe (960px unmerged feature engine, score >= 0.05,
+  NMS 0.7; `scripts/cache_sgdet.py`), each with its own 768-dim patch feature.
+- Directed *subject* / *object* role projections (feature + class), a router
+  scoring every ordered pair (key dot product + geometry), hard top-K, then a
+  predicate classifier on the selected pairs: **text** (cosine with OWLv2 text
+  embeddings of predicate phrases, per-group bias only) or **closed** (linear).
+- Trained 12 epochs; checkpoint chosen on held-out *training* videos
+  (with-constraint mR@50 at K = 128); test scored once.
+- Triplet score = router x predicate x subject score x object score; match =
+  IoU >= 0.5 and label. Recall per frame, mean recall per predicate.
+
+SGDet, test split (56,923 keyframes), text classifier:
+
+| Pairs kept | Object recall | Pair recall (bound) | wc R@20 | wc R@50 | wc mR@50 | nc R@50 | nc mR@50 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 32 | 0.621 | 0.470 (0.473) | 0.315 | 0.353 | 0.283 | 0.427 | 0.414 |
+| 64 | 0.621 | 0.472 (0.473) | 0.315 | 0.353 | 0.283 | 0.427 | 0.414 |
+| 128 | 0.621 | 0.473 (0.473) | 0.315 | 0.353 | 0.283 | 0.427 | 0.414 |
+| all (<= 992) | 0.621 | 0.473 (0.473) | 0.315 | 0.353 | 0.283 | 0.427 | 0.414 |
+
+| Classifier | SGDet@128 wc R@50 / mR@50 | PredCls wc R@50 / mR@50 |
+| --- | --- | --- |
+| Text | 0.353 / 0.283 | 0.648 / 0.413 |
+| Closed | 0.355 / 0.284 | 0.672 / 0.392 |
+
+- **The router is not the bottleneck.** At 32 pairs it already keeps 0.470 of
+  the 0.473 of true pairs that are reachable at all; recall does not move with
+  the budget. **Detection is**: 62% object recall, 47% of true pairs reachable.
+- **Text and closed classifiers are equal on seen predicates.** The text form's
+  case rests on unseen predicates (section 25).
+- Same detections through the *deployed* merged streaming detector (section 26)
+  change little.
+- (These heads take the object class as a learned vector per class; the
+  text-label version is section 29.)
+
+## 25. Held-out predicates: recall is the wrong measure; ranking shows weak transfer
+
+Four predicates (drinking_from, lying_on, wiping, beneath) given no gradient.
+
+**Recall rewarded calibration, not knowledge.** The closed control - which has
+no way to know an untrained predicate - scored *higher* unseen recall than the
+text classifier (PredCls nc mR@50 unseen 0.99 vs 0.73; SGDet 0.51 vs 0.11).
+Its untrained columns stay near logit 0 (probability ~0.5) while trained columns
+learn ~0 for absent predicates, and AG frames have so few pairs that the top 50
+triplets cover nearly every (pair, predicate). Under the graph constraint the
+text classifier's unseen columns never win (0.000-0.001).
+
+**Per-predicate AP over PredCls test pairs** (`scripts/heldout_ranking.py`;
+invariant to a column's offset, so an uninformed column scores its positive rate):
+
+| Held-out predicate | Chance | Text, held out | Closed, held out | Trained (text / closed) |
+| --- | --- | --- | --- | --- |
+| beneath | 0.168 | **0.397** | 0.265 | 0.899 / 0.924 |
+| lying_on | 0.009 | 0.036 | 0.030 | 0.183 / 0.218 |
+| drinking_from | 0.010 | 0.007 | 0.008 | 0.735 / 0.737 |
+| wiping | 0.002 | 0.003 | 0.001 | 0.011 / 0.023 |
+
+Seen-predicate mAP: text 0.550, closed 0.562 (held-out runs); 0.502 / 0.554
+with nothing held out.
+
+- **Transfer is weak.** Text beats the control only on *beneath* (+0.13 AP);
+  both are at chance on the two actions. The control is above chance on beneath
+  and lying_on too: random projections of features that encode geometry and
+  object class already correlate with them.
+- **Likely cause: OWLv2's text tower barely separates predicates.** The 26
+  phrase embeddings have mean pairwise cosine 0.90 (0.73-0.996; beneath is 0.97
+  from in, behind and covered by). Neighbours are sensible (drinking_from ->
+  eating) but too close to steer a classifier. Untested remedy: verb-aware
+  predicate embeddings (sentence encoder, larger text tower).
+- **There is currently no evidence for an open-vocabulary *predicate* claim.**
+
+## 26. The head on the deployed stream: accuracy and cost (RTX 5090)
+
+`scripts/relationship_stream.py`, `relations/runtime.py`.
+
+**SGDet through the deployed path** (previous frame seeds the stream, keyframe
+runs merged with box protection, then the head; 56,923 test keyframes):
+object recall 0.620, pair recall 0.471, wc R@20 0.314, R@50 0.351, mR@50 0.279,
+nc R@50 0.425, mR@50 0.410 - within ~1% (relative) of the cached unmerged
+numbers (section 24).
+
+**Sustained latency**, frames resident on the GPU, 001YG:
+
+| Configuration | Eager head | CUDA-graph head |
+| --- | --- | --- |
+| Streaming detector alone | 4.61 | 4.61 |
+| + head, 64 pairs | 6.36 | 4.90 |
+| + head, 128 pairs | 6.35 | **4.90 (31% of 16 ms)** |
+| + head, 256 pairs | 6.36 | 4.96 |
+| + head, 992 pairs | 6.42 | 5.08 |
+
+- Eagerly the head cost **1.75 ms whatever the budget** - ~100 small kernels,
+  launch-bound. Padding to the 32-object budget fixes shapes, so the head is
+  captured once as a CUDA graph and replayed: **0.29 ms at 128 pairs**, ~6% of
+  detector time (SG-ViT reports ~10% for its head). A test checks the graph and
+  eager paths against the plain unpadded computation.
+
+## 27. VG150 against SG-ViT's published numbers
+
+SG-ViT released no weights and reports no Action Genome results, so the
+comparison is on its headline benchmark (`scripts/cache_vg.py`,
+`scripts/train_vg_relationships.py`, `relations/vg_eval.py`).
+
+- Data: `maelic/VG150-coco-format`, the standard split; with images without
+  relations dropped: 57,720 train (canonical 57,723; the mirror drops 3 with no
+  boxes), 5,000 val, 26,446 test (canonical).
+- Evaluator: port of Scene-Graph-Benchmark's `sgg_eval.py` (the procedure
+  SG-ViT replicated): +1-pixel IoU, duplicates kept, graph constraint = best
+  predicate per pair. A test checks matching against the reference loop.
+- Detector: the same engine; VG's 150 classes scored zero-shot from its patch
+  features with OWLv2's class head (reproduces the engine's own logits to 0.10,
+  fp16 vs fp32). Top 64 detections, score >= 0.01, NMS 0.5.
+- Head as section 24, any detection may be the subject, 50 sigmoid predicates.
+
+Test, all pairs, percent:
+
+| Metric | Ours, text | Ours, closed | SG-ViT B/32 | SG-ViT B/16 | SG-ViT L/14 |
+| --- | --- | --- | --- | --- | --- |
+| wc mR@50 / mR@100 | 5.5 / 6.0 | 5.9 / 6.7 | 15.0 / 18.1 | 15.7 / 19.3 | 17.8 / 21.8 |
+| nc mR@50 / mR@100 | 10.6 / 13.9 | 11.2 / 14.9 | 20.5 / 24.8 | 21.4 / 26.6 | 23.9 / 29.5 |
+| nc R@20 / R@50 / R@100 | 19.0 / 25.0 / 28.6 | 19.4 / 25.3 / 28.8 | 19.8 / 28.1 / 34.5 | 20.2 / 28.8 / 35.4 | 21.8 / 31.1 / 38.3 |
+
+Diagnostics: object recall 51.9%; pair recall 30.9% at 128 pairs, 32.7% with
+all (the ceiling); PredCls (ground-truth boxes) wc R@100 61.7 / mR@100 16.0
+(text).
+
+- **Top of the ranking is on par** (nc R@20 19.0 vs 20.2); the gap is deep in
+  the ranking and in mean recall.
+- **Detection caps it:** only 32.7% of true pairs have both boxes recovered,
+  below SG-ViT's 35.4% nc R@100 - no head on these detections could match it.
+- **The head is frequency-biased:** PredCls mR@100 16.0 against R@100 61.7.
+- **Not a like-for-like comparison:** SG-ViT fine-tunes the whole encoder for
+  200k steps x 256 on VG/VG150/GQA200/HICO + Objects365; ours is a head trained
+  on frozen zero-shot features. It shows how far a frozen, cheap head gets.
+
+## 28. Why detection falls short, and whether a larger detector helps
+
+**Where missed objects go** (cached test detections):
+
+| | Label + IoU >= 0.5 | Any label, IoU >= 0.5 | Any label, IoU >= 0.3 |
+| --- | --- | --- | --- |
+| AG (32 detections) | 0.621 | 0.856 | 0.904 |
+| VG150 (64 detections) | 0.513 | 0.743 | 0.869 |
+
+~23 points on both are **well-placed boxes with only wrong labels**. Top
+confusions among those (`GT -> predicted`; top 25 cover 47% of AG's and 37% of
+VG's):
+
+- **VG: mostly naming** - man -> men (8.5%), person -> men, woman -> lady,
+  shoe -> sneaker, plane -> airplane, pole -> post, tire -> wheel, car ->
+  vehicle, coat -> jacket, hat -> cap. Some real errors (hair -> head).
+- **AG: a mix** - blurred category boundaries (book <-> paper/notebook,
+  blanket <-> towel <-> clothes, door <-> doorway, shelf -> closet/cabinet,
+  chair/bed -> sofa/couch) and real misidentification of small held objects
+  (dish -> cup/glass/bottle 4.6%, food -> cup/glass/bottle, cup -> phone/camera,
+  food -> phone/camera).
+
+**Largest zero-shot OWLv2** (`scripts/detector_smoke.py`; same 2,000 frames per
+dataset, caches' postprocessing, PyTorch fp16 eager):
+
+| | Base, 960px | Large L/14, 1008px |
+| --- | --- | --- |
+| AG object recall / class-agnostic / pair ceiling | 0.625 / 0.863 / 0.477 | 0.643 / 0.873 / 0.500 |
+| VG object recall / class-agnostic / pair ceiling | 0.513 / 0.747 / 0.330 | 0.542 / 0.756 / 0.365 |
+| Eager fp16 ms/image | 9.8 | 32.1 |
+
+- **Large buys +2-3.5 points for 3.3x compute** and leaves the ~23-point
+  labelling gap: both models localise the same objects and name them alike.
+- Estimated (unmeasured) large TensorRT fp16 ~16 ms: the whole budget; it would
+  need int8/fp8 and merging.
+
+## 29. Open-vocabulary objects in the head, and query-based evaluation
+
+**The head's closed spot.** Section 24's heads took each object's class as a
+learned vector per training class: a class never trained on - or any name
+queried at deployment - had an untrained input. Classes now enter as the
+projected text embedding of their name (the detector's own prompts;
+`RelationshipHead(class_embeds=...)`, `set_vocabulary()`); the learned form
+remains as the closed control (`*_idlabel` checkpoints).
+
+**Held-out objects.** laptop, pillow, broom and mirror removed from training
+entirely (every detection of them masked), then predicate AP over the 9,859
+PredCls test pairs involving them (`scripts/heldout_ranking.py`):
+
+| Head | Saw the four? | Pairs with held-out objects | Other pairs |
+| --- | --- | --- | --- |
+| Text labels | yes | 0.333 | 0.467 |
+| Text labels | **no** | **0.328** | 0.497 |
+| Learned per-class labels | **no** | **0.266** | 0.496 |
+
+Per object (text, held out vs learned, held out): laptop 0.397 vs 0.363, pillow
+0.386 vs 0.354, broom 0.409 vs 0.378, mirror 0.386 vs 0.362.
+
+- **Text labels keep ~98% of the accuracy on never-seen objects** (0.328 vs
+  0.333 when trained on them); learned labels lose ~20% (0.266).
+- **No measurable cost on seen classes.** Run-to-run spread is larger than any
+  difference: PredCls wc mR@50 was 0.358 (text, all classes), 0.396 (text,
+  four held out), 0.382 (learned, four held out), 0.413 (learned, section 24).
+  Single seeds; differences under ~0.04 are not resolved.
+
+**Query-based retrieval** (`scripts/query_retrieval.py`). Each (predicate,
+object class) query with >= 25 positive test frames (410 queries) scored
+independently on all 56,923 test keyframes: frame score = max over the head's
+top 128 pairs of router x predicate x person score x object-class score.
+Object scores either as the benchmark's format (a detection scores for its best
+class only, *argmax*) or each class scored on its own from OWLv2's class head on
+the cached features (*query*; reproduces the cached labels on 99.9% of
+detections). *Frame* AP: does the frame contain the triplet; *grounded* AP: and
+does the top pair match it (IoU >= 0.5, person and an object of the class
+carrying the predicate). Chance (positive rate) 0.021.
+
+| Head | Frame AP argmax / query | Grounded AP argmax / query | Held-out-object queries (46), grounded query |
+| --- | --- | --- | --- |
+| Text labels | 0.131 / 0.140 | 0.071 / 0.080 | 0.107 |
+| Learned labels | 0.132 / 0.140 | 0.072 / 0.080 | 0.109 |
+| Text labels, four held out | 0.128 / 0.138 | 0.069 / 0.079 | **0.098** |
+| Learned labels, four held out | 0.128 / 0.136 | 0.069 / 0.077 | **0.085** |
+
+- **The label format costs little on AG:** scoring each query on its own adds
+  +0.008-0.010 AP for every head - consistent but small, matching section 28's
+  finding that AG's label errors are partly real misidentification (VG's are
+  mostly naming; retrieval on VG is not yet measured).
+- **Held-out objects in retrieval:** text labels lose 0.009 grounded AP when
+  the four are never seen, learned labels 0.024. Smaller than in PredCls
+  because retrieval also depends on detection, which is unchanged.
+- Absolute retrieval quality is modest: frame mAP 0.14 is ~7x chance; grounded
+  0.08. The detector (section 28) bounds both.
+- Routing and role features use the detector's best label; only the final score
+  is per query. Conditioning the head on the queried class is untested.
+
+## 30. Open items
+
+Measured since the last revision of this list: the full relationship head on
+Action Genome, its deployed cost, VG150 against SG-ViT, detection failure
+analysis and the large detector (sections 24-29).
+
+**Relationship head** (done: router, text/closed classifiers, SGDet and
+PredCls, budget sweep, held-out predicates and objects, stream timing - sections
+24-29)
+- Open-vocabulary predicates are unsupported so far (section 25): try
+  verb-aware predicate embeddings (sentence encoder or larger text tower).
+- Mean recall: predicate rebalancing / reweighting (SG-ViT's rebalanced row:
+  19.3 -> 26.1 mR@100 on VG150).
+- Condition the head on the *queried* class at retrieval time (section 29
+  scores per query but routes with the detector's best label).
+- Check the AG recall metrics line-for-line against published AG evaluation
+  code before comparing with any published AG number (VG150 already uses a
+  port of the reference evaluator).
 
 **Detector**
-- `large_int8` / `large_fp16` / `base_fp8`: the 5090 has headroom (streaming
-  detector at ~28% of 16 ms) to afford a larger model if it is more accurate.
+- Labels, not localisation, are the main detection loss (section 28). Text-side
+  fixes that keep open vocabulary: per-class prompt ensembles and synonyms,
+  tuned on train/val only. A text-space adapter only with held-out-class AP.
+- `large_int8` / `large_fp16`: zero-shot L/14 gains only 2-3.5 points (section
+  28); worth building only alongside other changes.
 - Protect low-confidence large detections (floor recovers least, section 21).
 - Profile the remaining ~1.2 ms streaming overhead (section 23).
 - Padding-value A/B (0.0 vs 0.5); calibrated OWLv2 vs YOLO26 on shared classes;
@@ -822,4 +1066,5 @@ split (section 18), the pinned-memory streaming gap (section 16).
 - If identity becomes a priority: hand-label the ~640 videos with sustained
   hard cases (section 19) as the test set; train on continuity labels.
 - Commit the pending Stage 2 files (`botsort.py`, its tests, `pyproject.toml`
-  / `uv.lock` changes) together, and declare `scipy` directly.
+  / `uv.lock` changes) together, and declare `scipy` and `pyarrow` (VG150
+  reader) directly.

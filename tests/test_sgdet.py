@@ -94,6 +94,18 @@ class ModelAndLossTest(unittest.TestCase):
             self.assertEqual(p.shape, (3, len(PREDICATES)))
             self.assertTrue(torch.allclose(p[:, :A].sum(dim=1), torch.ones(3)))
 
+    def test_text_labels_accept_a_new_vocabulary(self):
+        embeds = torch.nn.functional.normalize(torch.randn(len(PREDICATES), 16), dim=1)
+        head = RelationshipHead(8, 3, embeds, hidden=32, key_dim=8, class_embeds=torch.randn(3, 16))
+        feats = torch.randn(1, 2, 8)
+        subj, _ = head.roles(feats, torch.tensor([[0, 2]]))
+        head.set_vocabulary(torch.randn(5, 16))  # a vocabulary with classes never trained on
+        subj5, _ = head.roles(feats, torch.tensor([[4, 3]]))
+        self.assertEqual(subj5.shape, subj.shape)
+        closed = RelationshipHead(8, 3, embeds, hidden=32, key_dim=8)
+        with self.assertRaises(ValueError):
+            closed.set_vocabulary(torch.randn(5, 16))
+
     def test_held_out_predicates_get_no_gradient(self):
         logits = torch.zeros(4, len(PREDICATES), requires_grad=True)
         targets = torch.zeros(4, len(PREDICATES), dtype=torch.bool)

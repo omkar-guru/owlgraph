@@ -95,3 +95,27 @@ def load_or_build(cache: Path, device: str = "cuda", phrases: list[str] | None =
     cache.parent.mkdir(parents=True, exist_ok=True)
     np.save(cache, embeds)
     return embeds
+
+
+def class_embeddings(prompt_embeds: np.ndarray, owner: np.ndarray, num_classes: int) -> np.ndarray:
+    """(C, D) unit-norm class embeddings: each class's prompt embeddings averaged,
+    from the same text queries the detector uses."""
+    out = np.stack([prompt_embeds[owner == c].mean(axis=0) for c in range(num_classes)])
+    return (out / np.linalg.norm(out, axis=1, keepdims=True)).astype(np.float32)
+
+
+def load_or_build_classes(cache: Path, classes: tuple[str, ...], device: str = "cuda") -> np.ndarray:
+    """Class-name embeddings for a vocabulary, built with the detector's prompts."""
+    cache = Path(cache)
+    if cache.exists():
+        return np.load(cache)
+    from ..ag.classes import build_prompt_index
+    from ..detect.owlv2 import encode_text_queries, load_owlv2
+
+    model, processor = load_owlv2("base", device=device, dtype=torch.float32)
+    prompts, owner = build_prompt_index(classes)
+    embeds = encode_text_queries(model, processor, prompts, device).cpu().numpy()
+    out = class_embeddings(embeds, np.asarray(owner), len(classes))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache, out)
+    return out

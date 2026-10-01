@@ -22,6 +22,12 @@ gradient - and reports seen and unseen mean recall separately. The text
 classifier can score them through their phrase embeddings; the closed
 classifier cannot, which is what makes it the control.
 
+``--labels text`` (default) feeds each object's class to the head as the text
+embedding of its name; ``--labels id`` uses a learned vector per class, the
+closed form earlier checkpoints have. ``--holdout-objects`` removes every
+detection of some object classes from training, so the head never sees them;
+``heldout_ranking.py`` then scores pairs involving them.
+
 Triplet score = router probability x predicate probability x subject score x
 object score.
 """
@@ -38,14 +44,26 @@ import torch
 
 from sggpipeline.ag.classes import AG_OBJECT_CLASSES
 from sggpipeline.ag.relations import PREDICATES
-from sggpipeline.pipeline import Workspace, write_report
+from sggpipeline.pipeline import Workspace, load_queries, write_report
 from sggpipeline.relations.model import (
     RelationshipHead, all_pair_geometry, classification_loss, predicate_probabilities,
     router_loss)
-from sggpipeline.relations.predicates import load_or_build
+from sggpipeline.relations.predicates import class_embeddings, load_or_build
 from sggpipeline.relations.sgdet import SGRecall, match_matrix, pair_targets
 
 HOLDOUTS = {"none": (), "four": ("drinking_from", "lying_on", "wiping", "beneath")}
+OBJECT_HOLDOUTS = {"none": (), "four": ("laptop", "pillow", "broom", "mirror")}
+
+
+def variant_name(classifier: str, holdout: str, labels: str = "text", holdout_objects: str = "none") -> str:
+    return (f"rel_{classifier}_{holdout}" + ("_idlabel" if labels == "id" else "")
+            + ("" if holdout_objects == "none" else f"_obj{holdout_objects}"))
+
+
+def ag_class_embeddings(ws) -> np.ndarray:
+    """AG class-name embeddings from the detector's own text queries."""
+    q = load_queries(ws, "base")
+    return class_embeddings(q.embeds, q.owner, len(AG_OBJECT_CLASSES))
 PAIR_BUDGETS = (32, 64, 128, 256, None)  # None = every ordered pair
 
 
@@ -170,6 +188,8 @@ def main() -> None:
     ap.add_argument("--artifacts", default="artifacts")
     ap.add_argument("--classifier", choices=["text", "closed"], default="text")
     ap.add_argument("--holdout", choices=sorted(HOLDOUTS), default="none")
+    ap.add_argument("--labels", choices=["text", "id"], default="text")
+    ap.add_argument("--holdout-objects", choices=sorted(OBJECT_HOLDOUTS), default="none")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -179,7 +199,7 @@ def main() -> None:
     device = "cuda"
     torch.manual_seed(args.seed)
     ws = Workspace(Path(args.artifacts))
-    name = f"rel_{args.classifier}_{args.holdout}"
+    name = variant_name(args.classifier, args.holdout, args.labels, args.holdout_objects)
 
     load = lambda p: dict(np.load(p, allow_pickle=False))  # noqa: E731
     train_np = load(ws.root / "sgdet" / "train.npz")
@@ -190,6 +210,10 @@ def main() -> None:
     held_out = np.array([zlib.crc32(v.encode()) % 20 == 0 for v in train_np["video_ids"]])
     train = Frames(train_np, device, np.flatnonzero(~held_out))
     val = Frames(train_np, device, np.flatnonzero(held_out))
+    hidden_objects = torch.tensor([AG_OBJECT_CLASSES.index(c) for c in OBJECT_HOLDOUTS[args.holdout_objects]],
+                                  dtype=torch.long, device=device)
+    for split in (train, val):  # the head never sees a detection of a held-out class
+        split.valid &= ~torch.isin(split.labels, hidden_objects)
     test = Frames(test_np, device)
     predcls = predcls_frames(test_np, load(ws.root / "pair_features" / "test.npz"), device)
     print(f"{name}: train {len(train)} frames, val {len(val)} ({len(set(val.video_ids))} held-out "
@@ -199,7 +223,9 @@ def main() -> None:
     for p in HOLDOUTS[args.holdout]:
         seen[PREDICATES.index(p)] = False
     embeds = torch.from_numpy(load_or_build(ws.cache("predicate_embeds_base.npy"))).to(device)
-    model = RelationshipHead(768, len(AG_OBJECT_CLASSES), embeds, classifier=args.classifier).to(device)
+    class_embeds = torch.from_numpy(ag_class_embeddings(ws)) if args.labels == "text" else None
+    model = RelationshipHead(768, len(AG_OBJECT_CLASSES), embeds, classifier=args.classifier,
+                             class_embeds=class_embeds).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     gen = torch.Generator(device=device).manual_seed(args.seed)
@@ -226,8 +252,9 @@ def main() -> None:
     seen_np = seen.cpu().numpy() if args.holdout != "none" else None
     sgdet = {("all" if k is None else k): acc.summary(seen_np) for k, acc in evaluate(model, test).items()}
     pred = evaluate(model, predcls, budgets=(None,), score_detections=False)[None].summary(seen_np)
-    write_report({"variant": name, "classifier": args.classifier,
-                  "held_out_predicates": list(HOLDOUTS[args.holdout]), "history": history,
+    write_report({"variant": name, "classifier": args.classifier, "labels": args.labels,
+                  "held_out_predicates": list(HOLDOUTS[args.holdout]),
+                  "held_out_objects": list(OBJECT_HOLDOUTS[args.holdout_objects]), "history": history,
                   "sgdet_by_pair_budget": sgdet, "predcls": pred,
                   "protocol": "IoU>=0.5 and label match; triplet score = router x predicate x "
                               "subject x object; budget 32 detections; test scored once"},

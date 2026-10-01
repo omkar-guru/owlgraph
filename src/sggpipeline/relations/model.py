@@ -5,7 +5,11 @@ the frozen detector):
 
 1. **Role features.** Each detection gets a *subject* and an *object* projection
    of its feature plus a label embedding. Roles are separate because the pair is
-   directed: person-holds-cup is not cup-holds-person.
+   directed: person-holds-cup is not cup-holds-person. The label enters through
+   the *text embedding* of its class name (projected), so an object class never
+   seen in training - or any name queried at deployment - still has one. The
+   older per-class learned vector (``class_embeds=None``) is kept for loading
+   earlier checkpoints and as the closed control.
 2. **Router.** Every ordered pair (i, j), i != j, gets a cheap score: a dot
    product between i's subject key and j's object key, plus a small term on
    their relative geometry. Only the top-K pairs go further; the rest are never
@@ -85,7 +89,8 @@ def predicate_probabilities(logits: torch.Tensor, schema: PredicateSchema = AG_S
 class RelationshipHead(nn.Module):
     def __init__(self, feature_dim: int, num_classes: int, predicate_embeds: torch.Tensor | None,
                  classifier: str = "text", hidden: int = 512, key_dim: int = 128,
-                 dropout: float = 0.1, schema: PredicateSchema = AG_SCHEMA):
+                 dropout: float = 0.1, schema: PredicateSchema = AG_SCHEMA,
+                 class_embeds: torch.Tensor | None = None):
         super().__init__()
         self.schema = schema
         if classifier not in ("text", "closed"):
@@ -96,7 +101,11 @@ class RelationshipHead(nn.Module):
         self.key_dim = key_dim
         self.role_subject = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, hidden))
         self.role_object = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, hidden))
-        self.label = nn.Embedding(num_classes, hidden)
+        if class_embeds is None:
+            self.label = nn.Embedding(num_classes, hidden)  # closed: one learned vector per class
+        else:
+            self.register_buffer("class_embeds", F.normalize(class_embeds.float(), dim=1))
+            self.label_text = nn.Linear(class_embeds.shape[1], hidden)
         self.subject_key = nn.Linear(hidden, key_dim)
         self.object_key = nn.Linear(hidden, key_dim)
         self.router_geometry = nn.Sequential(nn.Linear(GEOMETRY_DIM, 64), nn.GELU(), nn.Linear(64, 1))
@@ -116,8 +125,19 @@ class RelationshipHead(nn.Module):
             self.closed = nn.Linear(hidden, len(schema))
 
     # -- per detection ---------------------------------------------------------
+    @property
+    def text_labels(self) -> bool:
+        return hasattr(self, "label_text")
+
+    def set_vocabulary(self, class_embeds: torch.Tensor) -> None:
+        """Swap in another object vocabulary (text-label heads only); labels then
+        index into it."""
+        if not self.text_labels:
+            raise ValueError("a head with learned per-class label vectors has a fixed vocabulary")
+        self.class_embeds = F.normalize(class_embeds.float(), dim=1).to(self.class_embeds.device)
+
     def roles(self, features: torch.Tensor, labels: torch.Tensor):
-        lab = self.label(labels)
+        lab = self.label_text(self.class_embeds[labels]) if self.text_labels else self.label(labels)
         return self.role_subject(features) + lab, self.role_object(features) + lab
 
     # -- router ------------------------------------------------------------------
@@ -179,3 +199,13 @@ def router_loss(pair_logits: torch.Tensor, positive: torch.Tensor, valid: torch.
                          torch.ones_like(pair_logits))
     return F.binary_cross_entropy_with_logits(pair_logits[valid], positive[valid].float(),
                                               weight=weight[valid])
+
+
+def load_relationship_head(path, num_classes: int, predicate_embeds: torch.Tensor, classifier: str = "text",
+                           schema: PredicateSchema = AG_SCHEMA, device: str = "cuda") -> RelationshipHead:
+    """Rebuild a saved head, text-label or learned-label, from its state dict."""
+    state = torch.load(path, map_location=device, weights_only=True)
+    model = RelationshipHead(768, num_classes, predicate_embeds, classifier=classifier, schema=schema,
+                             class_embeds=state.get("class_embeds"))
+    model.load_state_dict(state)
+    return model.to(device).eval()

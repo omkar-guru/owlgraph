@@ -53,6 +53,15 @@ class RuntimeTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_graph_and_eager_match_reference(self):
+        self.check()
+
+    def test_text_label_head(self):
+        class_embeds = torch.nn.functional.normalize(torch.randn(len(AG_OBJECT_CLASSES), 512), dim=1)
+        torch.save(RelationshipHead(768, len(AG_OBJECT_CLASSES), torch.from_numpy(self.embeds),
+                                    class_embeds=class_embeds).state_dict(), self.ckpt)
+        self.check()
+
+    def check(self):
         rng = np.random.default_rng(0)
         graph = RelationshipPredictor(self.ckpt, self.embeds, pair_budget=64, cuda_graph=True)
         eager = RelationshipPredictor(self.ckpt, self.embeds, pair_budget=64, cuda_graph=False)

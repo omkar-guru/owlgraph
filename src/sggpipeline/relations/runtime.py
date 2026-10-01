@@ -16,7 +16,7 @@ import torch
 
 from ..ag.classes import AG_OBJECT_CLASSES
 from ..ag.relations import PREDICATES
-from .model import RelationshipHead, all_pair_geometry
+from .model import all_pair_geometry, load_relationship_head
 from .sgdet import constrained_mask
 
 
@@ -62,10 +62,8 @@ class RelationshipPredictor:
     def __init__(self, checkpoint: Path, predicate_embeds: np.ndarray, classifier: str = "text",
                  max_objects: int = 32, pair_budget: int = 128, device: str = "cuda",
                  cuda_graph: bool = True):
-        self.model = RelationshipHead(768, len(AG_OBJECT_CLASSES),
-                                      torch.from_numpy(predicate_embeds), classifier=classifier)
-        self.model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-        self.model.to(device).eval()
+        self.model = load_relationship_head(checkpoint, len(AG_OBJECT_CLASSES),
+                                            torch.from_numpy(predicate_embeds), classifier, device=device)
         self.max_objects = max_objects
         self.pair_budget = pair_budget
         self.device = torch.device(device)

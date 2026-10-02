@@ -1,0 +1,27 @@
+{
+  "input": "synthetic",
+  "frames": [
+    {
+      "timestamp": 0.0,
+      "track_ids": [
+        0,
+        1
+      ],
+      "is_new": [
+        true,
+        true
+      ]
+    },
+    {
+      "timestamp": 1.0,
+      "track_ids": [
+        1,
+        0
+      ],
+      "is_new": [
+        false,
+        false
+      ]
+    }
+  ]
+}

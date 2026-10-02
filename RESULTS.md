@@ -1101,6 +1101,7 @@ PredCls, budget sweep, held-out predicates and objects, stream timing - sections
 - Baseline: conventional tracker with the streaming detector's features.
 - If identity becomes a priority: hand-label the ~640 videos with sustained
   hard cases (section 19) as the test set; train on continuity labels.
-- Commit the pending Stage 2 files (`botsort.py`, its tests, `pyproject.toml`
-  / `uv.lock` changes) together, and declare `scipy` and `pyarrow` (VG150
-  reader) directly.
+- Repository maintenance update (2026-10-02): BoT-SORT integration and tests
+  are included; `scipy` and `pyarrow` (VG150 reader) are declared directly.
+  CPU example and full suite verified: 66 passed, 2 CUDA tests skipped.
+  Real-video identity evaluation remains open.

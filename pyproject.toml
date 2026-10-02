@@ -1,7 +1,7 @@
 [project]
 name = "sggpipeline"
 version = "0.1.0"
-description = "Open-vocabulary video scene graph pipeline - Stage 1: detector benchmarking"
+description = "Open-vocabulary detection, relationship prediction, and tracking research"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -9,6 +9,8 @@ dependencies = [
     "torchvision",
     "transformers>=4.50",
     "numpy",
+    "scipy",
+    "pyarrow",
     "pillow",
     "opencv-python-headless",
     "av",
@@ -20,10 +22,16 @@ dependencies = [
     "pyyaml",
     "markitdown[docx]>=0.1.7",
     "nvidia-modelopt[onnx]>=0.46",
+    "ultralytics>=8.4.165",
 ]
 
 [project.scripts]
 sgg = "sggpipeline.cli:main"
+
+[project.optional-dependencies]
+tracking = [
+    "lap>=0.5.12,<0.6",
+]
 
 [build-system]
 requires = ["uv_build>=0.9,<0.15"]

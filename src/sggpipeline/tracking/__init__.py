@@ -3,3 +3,7 @@
 from .tracker import AssociationTracker, TrackerConfig, TrackingResult
 
 __all__ = ["AssociationTracker", "TrackerConfig", "TrackingResult"]
+
+from .botsort import BoTSORTConfig, OWLBoTSORT
+
+__all__ += ["BoTSORTConfig", "OWLBoTSORT"]

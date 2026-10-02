@@ -20,6 +20,7 @@ import torch
 from .cache import DetectionCache, load_caches
 from .identity import IdentityHead, identity_loss
 from .tracker import AssociationTracker, TrackerConfig
+from .botsort import BoTSORTConfig, OWLBoTSORT
 
 
 def train_identity(caches: list[DetectionCache], *, steps: int = 500,
@@ -96,7 +97,8 @@ def train_identity(caches: list[DetectionCache], *, steps: int = 500,
 def association_metrics(cache: DetectionCache, predicted_ids: np.ndarray) -> dict:
     """Count ID changes and cross-instance reuse on known detection rows only.
 
-    Switches compare to the last labelled observation (including gaps).
+    Switches compare to the last labelled observation with an assigned ID.
+    Predictions of -1 are counted as unassigned, never as a shared identity.
     Cross-instance transfers count a predicted ID changing its known physical
     owner. Fragmentation counts additional predicted IDs per true instance.
     """
@@ -105,12 +107,15 @@ def association_metrics(cache: DetectionCache, predicted_ids: np.ndarray) -> dic
     last_prediction: dict[int, int] = {}
     last_owner: dict[int, int] = {}
     identities: dict[int, set[int]] = {}
-    switches = transfers = links = observations = 0
+    switches = transfers = links = observations = unassigned = 0
     for truth, predicted in zip(cache.instance_ids, predicted_ids, strict=True):
         truth, predicted = int(truth), int(predicted)
         if truth < 0:
             continue
         observations += 1
+        if predicted < 0:
+            unassigned += 1
+            continue
         if truth in last_prediction:
             links += 1
             switches += last_prediction[truth] != predicted
@@ -119,26 +124,38 @@ def association_metrics(cache: DetectionCache, predicted_ids: np.ndarray) -> dic
         last_prediction[truth], last_owner[predicted] = predicted, truth
         identities.setdefault(truth, set()).add(predicted)
     return {"labelled_observations": observations, "identity_links": links,
+            "assigned_observations": observations - unassigned, "unassigned_observations": unassigned,
+            "assignment_coverage": (observations - unassigned) / observations if observations else None,
             "id_switches": switches, "cross_instance_transfers": transfers,
             "extra_ids_per_instance_total": sum(len(ids) - 1 for ids in identities.values()),
             "id_switch_rate": switches / links if links else None}
 
 
-def compare(caches: list[DetectionCache], config: TrackerConfig,
-            model: IdentityHead | None = None) -> dict:
+def compare(caches: list[DetectionCache], config: TrackerConfig | BoTSORTConfig,
+            model: IdentityHead | None = None, *, tracker_name: str = "baseline") -> dict:
     """Replay identical detections with frozen appearance and learned identity."""
+    if tracker_name not in {"baseline", "botsort"}:
+        raise ValueError("Unknown tracker")
+    config_type = BoTSORTConfig if tracker_name == "botsort" else TrackerConfig
+    if not isinstance(config, config_type):
+        raise ValueError("Configuration does not match selected tracker")
     if model is not None:
         model.eval()
     result = {"config": asdict(config), "metrics_scope": "association conditional on labelled detection rows",
               "timing_scope": "CPU descriptor transform and association; excludes detection and cache I/O",
               "variants": {}}
+    result["tracker"] = tracker_name
+    result["ambiguity_estimates_available"] = tracker_name == "baseline"
     for name in (["appearance", "identity"] if model is not None else ["appearance"]):
         videos, latencies = [], []
         for cache in caches:
-            tracker = AssociationTracker(config)
+            tracker = OWLBoTSORT(config) if tracker_name == "botsort" else AssociationTracker(config)
+            if tracker_name == "botsort":
+                result["backend_version"] = tracker.backend_version
             ids, uncertainty, expired_count = [], 0, 0
             for f, (start, end) in enumerate(zip(cache.offsets[:-1], cache.offsets[1:], strict=True)):
-                detections = SimpleNamespace(boxes=cache.boxes[start:end], labels=cache.labels[start:end])
+                detections = SimpleNamespace(boxes=cache.boxes[start:end], labels=cache.labels[start:end],
+                                             scores=cache.scores[start:end])
                 features = cache.features[start:end]
                 tick = time.perf_counter()
                 if name == "identity":
@@ -152,11 +169,13 @@ def compare(caches: list[DetectionCache], config: TrackerConfig,
             videos.append({"video_id": cache.metadata["video_id"], "split": cache.metadata["split"],
                            "identity_source": cache.metadata["identity_source"],
                            "metrics": association_metrics(cache, np.asarray(ids, dtype=np.int64)),
-                           "uncertain_observations": uncertainty, "retired_tracks": expired_count,
+                           "uncertain_observations": uncertainty if tracker_name == "baseline" else None,
+                           "retired_tracks": expired_count,
                            "track_ids": ids})
         totals = {key: sum(v["metrics"][key] for v in videos) for key in
-                  ("labelled_observations", "identity_links", "id_switches",
+                  ("labelled_observations", "assigned_observations", "unassigned_observations", "identity_links", "id_switches",
                    "cross_instance_transfers", "extra_ids_per_instance_total")}
+        totals["assignment_coverage"] = totals["assigned_observations"] / totals["labelled_observations"] if totals["labelled_observations"] else None
         totals["id_switch_rate"] = totals["id_switches"] / totals["identity_links"] if totals["identity_links"] else None
         result["variants"][name] = {"totals": totals, "videos": videos,
                                     "median_frame_ms": float(np.median(latencies)),
@@ -187,7 +206,8 @@ def main(argv: list[str] | None = None) -> None:
     evaluate = sub.add_parser("evaluate", help="Compare fixed-detection tracking on held-out caches")
     evaluate.add_argument("--caches", nargs="+", required=True)
     evaluate.add_argument("--checkpoint", help="Omit for appearance baseline only")
-    evaluate.add_argument("--config", help="JSON mapping of TrackerConfig settings, fixed across variants")
+    evaluate.add_argument("--tracker", choices=["baseline", "botsort"], default="baseline")
+    evaluate.add_argument("--config", help="JSON settings for the selected tracker, fixed across variants")
     evaluate.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     caches = load_caches(args.caches, require_identity=True)
@@ -211,7 +231,8 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError("Evaluate on held-out val or test videos")
         if len({c.metadata["split"] for c in caches}) != 1:
             raise ValueError("Do not pool validation and test results")
-        config = TrackerConfig(**json.loads(Path(args.config).read_text())) if args.config else TrackerConfig()
+        config_type = BoTSORTConfig if args.tracker == "botsort" else TrackerConfig
+        config = config_type(**json.loads(Path(args.config).read_text())) if args.config else config_type()
         model = None
         if args.checkpoint:
             checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -226,7 +247,7 @@ def main(argv: list[str] | None = None) -> None:
                 raise ValueError("Checkpoint feature dimension does not match evaluation cache")
             model = IdentityHead(**checkpoint["dimensions"])
             model.load_state_dict(checkpoint["state_dict"])
-        report = compare(caches, config, model)
+        report = compare(caches, config, model, tracker_name=args.tracker)
         report["caches"] = [_fingerprint(p) for p in args.caches]
         report["checkpoint"] = _fingerprint(args.checkpoint) if args.checkpoint else None
         output.write_text(json.dumps(report, indent=2) + "\n")

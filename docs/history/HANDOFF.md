@@ -2,7 +2,7 @@
 
 Written for: whoever picks this up on the new box (likely you, later).
 
-Status as of the last local session. Stage 1 of [plan.md](plan.md) — detector
+Status as of the last local session. Stage 1 of [plan.md](../../plan.md) — detector
 quality and speed on Action Genome — is **partly complete**. The fp16 side is
 finished and measured. The quantized side is not: it is blocked on host RAM,
 which is why the local machine kept dying.
@@ -320,7 +320,7 @@ from sggpipeline.detect.quantize import to_fp8_onnx   # see /tmp/fp8_calib.py pa
 
 `src/sggpipeline/tracking/` (association, identity descriptor, feature pooling)
 and `tests/test_tracking.py` already exist in the tree; they were not part of the
-Stage 1 work described here. Stage 2 in [plan.md](plan.md#L111) wants conventional
+Stage 1 work described here. Stage 2 in [plan.md](../../plan.md#L111) wants conventional
 geometry/motion/appearance association compared against the learned identity
 descriptor **on fixed detections** — which Step 1 above now provides.
 

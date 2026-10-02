@@ -107,7 +107,7 @@ uv run python scripts/relationship_stream.py --latency --video /path/to/video.mp
 ```
 
 For tracking interfaces, cache requirements, identity-label provenance, and
-BoT-SORT cadence constraints, see [STEP2.md](STEP2.md).
+BoT-SORT cadence constraints, see [docs/tracking.md](docs/tracking.md).
 
 The original detector CLI remains available:
 
@@ -121,7 +121,7 @@ uv run sgg evaluate --variant base_fp16 --ag-root /path/to/ag
 ```
 
 Action Genome requires annotations and extracted frames; see the
-[cloud setup guide](CLOUD_AGENT_QUICKSTART.md) for data preparation. Obtain
+[cloud setup guide](docs/cloud_setup.md) for data preparation. Obtain
 upstream datasets separately under their terms. INT8/FP8 paths are experimental;
 `large_int8` is not a completed accuracy/performance comparison.
 
@@ -138,6 +138,13 @@ upstream datasets separately under their terms. INT8/FP8 paths are experimental;
 | `examples/` | Reproducible synthetic visual demonstration |
 
 [RESULTS.md](RESULTS.md) is the experiment record; [plan.md](plan.md) describes
-the broader research proposal. [HANDOFF.md](HANDOFF.md) is historical and
-predates the relationship work. [Resume wording](docs/RESUME.md) summarizes
+the broader research proposal. [docs/history/HANDOFF.md](docs/history/HANDOFF.md) is a historical
+hand-off note that predates the relationship work. [Resume wording](docs/RESUME.md) summarizes
 implemented contributions with the measurement scope preserved.
+
+## License
+
+The code is released under the [MIT License](LICENSE). Datasets and model
+weights are not included and keep their own terms: Action Genome and Charades
+are for non-commercial research use, VG150 derives from Visual Genome (CC BY
+4.0), and OWLv2 and the text encoders follow their publishers' licenses.

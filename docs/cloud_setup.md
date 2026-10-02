@@ -2,7 +2,7 @@
 
 Run this guide on the Linux NVIDIA GPU VM; start by cloning the repository below. It reflects
 the baseline setup inspected on 2026-09-24, with status updated on 2026-10-02. Read `README.md` for the detector workflow,
-`HANDOFF.md` for historical measurements, and `plan.md` for the proposed research
+`docs/history/HANDOFF.md` for historical measurements, and `plan.md` for the proposed research
 architecture. Treat source code as authoritative when those documents disagree.
 
 ## What you are taking over
@@ -235,7 +235,7 @@ Other current boundaries:
   Training/evaluation require `DetectionCache` NPZ files with frozen detections,
   features, timestamps, and trusted instance correspondences. There is no
   end-to-end detector-to-cache CLI. AG category labels are not instance IDs.
-- `HANDOFF.md` contains stale claims: the repository now has commits,
+- `docs/history/HANDOFF.md` contains stale claims: the repository now has commits,
   `acgdataset/` is already ignored, and calibration is not streamed by the CLI.
   Its `/tmp/fp8_calib.py` reference is not a repository-provided script.
 

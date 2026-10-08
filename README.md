@@ -1,4 +1,4 @@
-# sggpipeline — fast open-vocabulary scene graphs
+# OwlGraph — fast open-vocabulary scene graphs
 
 Research project in progress: reuse a frozen OWLv2 detector's visual features
 for efficient object detection, directed relationship prediction, and instance
